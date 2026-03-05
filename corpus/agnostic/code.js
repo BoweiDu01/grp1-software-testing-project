@@ -1,0 +1,1 @@
+function test(x) { return (x > 0) ? [1,2,3] : null; }
