@@ -1,7 +1,7 @@
 ## To run main (Recommended to build in venv)
-py -m venv venv
-npm build
-.\venv\Scripts\Activate.ps1
+py -m venv venv  
+npm build  
+.\venv\Scripts\Activate.ps1  
 py run fuzzer_script.py   
 
 # Expected Outputs
