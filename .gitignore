@@ -2,3 +2,10 @@
 /package.json
 /temp store corpus
 /venv
+venv/
+__pycache__/
+*.pyc
+*.pyo
+/crashes/
+/logs/
+/IPv4-IPv6-parser/
