@@ -115,7 +115,9 @@ class CoverageTracker:
         self.new_distance_record = False
 
     def on_message(self, message, data):
-        global current_test_data
+        global current_test_data 
+        global dashboard      
+
         if message['type'] == 'send':
             payload = message['payload']
             if payload['type'] == 'new_block':
@@ -144,64 +146,63 @@ class CoverageTracker:
             # Only save if it's a real memory corruption/system failure
             save_crash(current_test_data, "fatal_system_crash")
 
-tracker = CoverageTracker()
 
-# --- 5. Execution Logic ---
-def run_target_with_timeout(binary_path, input_data, timeout=5):
-    tracker.new_block_found = False
-    tracker.new_distance_record = False
-    start_time = time.time()
+# --- 5. Execution Logic (Unused, can remove later)--- 
+# def run_target_with_timeout(binary_path, input_data, timeout=5):
+#     tracker.new_block_found = False
+#     tracker.new_distance_record = False
+#     start_time = time.time()
     
-    # 1. Spawn the parent normally
-    try:
-        pid = frida.spawn([binary_path, "--ipstr", input_data.decode(errors='ignore')])
-        frida.resume(pid) # Let the parent start extracting
+#     # 1. Spawn the parent normally
+#     try:
+#         pid = frida.spawn([binary_path, "--ipstr", input_data.decode(errors='ignore')])
+#         frida.resume(pid) # Let the parent start extracting
         
-        # 2. Wait and "Hunt" for the child process
-        # PyInstaller usually names the child the same as the parent
-        child_pid = None
-        target_name = os.path.basename(binary_path)
+#         # 2. Wait and "Hunt" for the child process
+#         # PyInstaller usually names the child the same as the parent
+#         child_pid = None
+#         target_name = os.path.basename(binary_path)
             
-        search_start = time.time()
-        while (time.time() - search_start) < 2.0: # Search for 2 seconds
-            for proc in psutil.process_iter(['pid', 'name']):
-                if proc.info['name'] == target_name and proc.info['pid'] != pid:
-                    child_pid = proc.info['pid']
-                    break
-            if child_pid: break
-            time.sleep(0.05)
+#         search_start = time.time()
+#         while (time.time() - search_start) < 2.0: # Search for 2 seconds
+#             for proc in psutil.process_iter(['pid', 'name']):
+#                 if proc.info['name'] == target_name and proc.info['pid'] != pid:
+#                     child_pid = proc.info['pid']
+#                     break
+#             if child_pid: break
+#             time.sleep(0.05)
 
-        # 3. Attach to whichever one we found (Child preferred, Parent fallback)    
-        attach_pid = child_pid if child_pid else pid
-        session = frida.attach(attach_pid)
+#         # 3. Attach to whichever one we found (Child preferred, Parent fallback)    
+#         attach_pid = child_pid if child_pid else pid
+#         session = frida.attach(attach_pid)
         
-        with open("fuzzer_hook.js", "r") as f:
-            script = session.create_script(f.read())
+#         with open("fuzzer_hook.js", "r") as f:
+#             script = session.create_script(f.read())
         
-        script.on('message', tracker.on_message)
-        script.load()
+#         script.on('message', tracker.on_message)
+#         script.load()
         
-        # 4. Monitor Loop
-        while True:
-            if not psutil.pid_exists(attach_pid):
-                time.sleep(0.3)
-                break
+#         # 4. Monitor Loop
+#         while True:
+#             if not psutil.pid_exists(attach_pid):
+#                 time.sleep(0.3)
+#                 break
                 
-            if (time.time() - start_time) > timeout:
-                try:
-                    p = psutil.Process(attach_pid)
-                    p.kill()
-                    if child_pid: psutil.Process(pid).kill()
-                except: pass
-                return "hang", timeout
+#             if (time.time() - start_time) > timeout:
+#                 try:
+#                     p = psutil.Process(attach_pid)
+#                     p.kill()
+#                     if child_pid: psutil.Process(pid).kill()
+#                 except: pass
+#                 return "hang", timeout
             
-            time.sleep(0.1)
+#             time.sleep(0.1)
             
-        return "success", time.time() - start_time
+#         return "success", time.time() - start_time
 
-    except Exception as e:
-        print(f"Error: {e}")
-        return "error", 0
+#     except Exception as e:
+#         print(f"Error: {e}")
+#         return "error", 0
 
 # --- 6. Stats & Dashboard ---
 class PerformanceStats:
@@ -251,7 +252,7 @@ class FuzzerDashboard:
         bug_density = (self.total_bugs / self.iterations * 100) if self.iterations > 0 else 0
         
         print("="*50)
-        print(f" GEMINI CUSTOM FUZZER - win_ipv4_parser.exe")
+        print(f" CUSTOM FUZZER - 2  win_ipv4_parser.exe")
         print("="*50)
         print(f" Iterations: {self.iterations:<10} | Speed: {speed:.2f} exec/s")
         print(f" Total Bugs: {self.total_bugs:<10} | Hit Rate: {bug_density:.2f}%")
@@ -261,6 +262,98 @@ class FuzzerDashboard:
             print(f"  {op.__name__:<18}: {scheduler.probabilities[i]:.4f}")
         print("="*50)
 
+class PersistentFuzzer:
+    def __init__(self, binary_path):
+        self.binary_path = binary_path
+        self.device = frida.get_local_device()
+        
+        # We need to track the active script (the one inside the CHILD)
+        self.active_script = None 
+        self.child_pid = None
+        self.parent_pid = None
+        
+        # 1. Register the listener for child processes
+        self.device.on('child-added', self.on_child_added)
+        
+        self.start_session()
+
+    def on_child_added(self, child):
+        print(f"[*] REAL PARSER DETECTED! (PID: {child.pid})")
+        self.child_pid = child.pid
+        
+        try:
+            # 2. Attach to the child immediately
+            session = self.device.attach(child.pid)
+            with open("fuzzer_hook.js", "r") as f:
+                script = session.create_script(f.read())
+            
+            script.on('message', tracker.on_message)
+            script.load()
+            
+            # 3. Save this script so run_one() can use it
+            self.active_script = script
+            
+            # 4. Let the child run!
+            self.device.resume(child.pid)
+        except Exception as e:
+            print(f"[!] Error hooking child: {e}")
+
+    def start_session(self):
+        try:
+            # Kill leftovers
+            if self.parent_pid:
+                try: psutil.Process(self.parent_pid).kill()
+                except: pass
+
+            print(f"[*] Spawning Bootloader: {self.binary_path}")
+            self.parent_pid = self.device.spawn([self.binary_path])
+            
+            # 5. Attach to parent and ENABLE GATING
+            parent_session = self.device.attach(self.parent_pid)
+            parent_session.enable_child_gating()
+            
+            # Resume parent so it can extract the child
+            self.device.resume(self.parent_pid)
+            
+            # 6. Wait for the child to spawn and the hook to load
+            print("[*] Waiting for child extraction...")
+            timeout = 10
+            start = time.time()
+            while self.active_script is None:
+                if (time.time() - start) > timeout:
+                    print("[!] Timeout waiting for child process.")
+                    self.restart()
+                    break
+                time.sleep(0.5)
+                
+        except Exception as e:
+            print(f"[!] Failed to start session: {e}")
+            sys.exit(1)
+
+    def restart(self):
+        print("[!] Restarting entire process chain...")
+        self.active_script = None
+        self.start_session()
+
+    def run_one(self, data):
+        global dashboard # Ensure we can reach the dashboard
+        tracker.new_block_found = False
+        
+        if not self.active_script:
+            return "error", 0
+
+        try:
+            self.active_script.exports.fuzz(list(data)) 
+            return "success", 0
+        except Exception as e:
+            # THIS is where fatal crashes land
+            dashboard.total_bugs += 1  # <--- ADD THIS LINE
+            save_crash(data, "fatal_system_crash")
+            self.restart()
+            return "crash", 0
+
+tracker = CoverageTracker()
+dashboard = FuzzerDashboard()  
 # --- 7. Main Loop ---
 def main():
     set_reproducibility(42)
@@ -268,7 +361,7 @@ def main():
     global current_test_data
     loader = CorpusLoader("corpus")
     scheduler = MOPT_Scheduler(operators)
-    dashboard = FuzzerDashboard()
+    fuzzer_engine = PersistentFuzzer("./win-ipv4-parser.exe")
     
     while True:
         seed = loader.get_random_seed()
@@ -280,7 +373,7 @@ def main():
             mutated_input = op(seed)
         
         current_test_data = mutated_input
-        status, elapsed = run_target_with_timeout(binary_path, mutated_input)
+        status, elapsed = fuzzer_engine.run_one(mutated_input)
         
         if status == "error": continue
 
