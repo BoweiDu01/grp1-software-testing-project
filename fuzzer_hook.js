@@ -1,47 +1,75 @@
 // fuzzer_hook.js
-const seen_edges = new Set();
-let prev_block = "0";
+const MAP_SIZE = 65536;
+const coverage_map = new Uint8Array(MAP_SIZE);
+let prev_location = 0;
 
-// DELETE OR COMMENT OUT ALL MODULE FILTERING LOGIC
-// We want to see IF we can get any blocks at all.
-function isMainModule(addr) {
-    return true; 
+// 1. Attempt to find the target function
+let targetAddr = null;
+try {
+    targetAddr = Module.findExportByName(null, "parse_ipv4") || 
+                 DebugSymbol.fromName("parse_ipv4").address;
+} catch (e) {
+    // If not found, we are likely in the Parent/Bootloader process
 }
 
-Stalker.follow({
-    events: { block: true },
-    onReceive: function (events) {
-        const blocks = Stalker.parse(events);
-        blocks.forEach(b => {
-            let currStr = b[0].toString();
-            let edge = prev_block + "->" + currStr;
-            if (!seen_edges.has(edge)) {
-                seen_edges.add(edge);
-                send({ type: 'new_block', address: currStr });
-            }
-            prev_block = currStr;
-        });
-    },
-    transform: function (iterator) {
-        let instruction = iterator.next();
-        while (instruction !== null) {
-            // Instrument ALL CMPs for now to verify logic
-            if (instruction.mnemonic === 'cmp') {
-                const instrAddr = instruction.address;
-                iterator.putCallout((context) => {
-                    try {
-                        let val1 = context.rax.toInt32();
-                        let val2 = context.rbx.toInt32();
-                        send({ 
-                            type: 'cmp_distance', 
-                            address: instrAddr.toString(), 
-                            distance: Math.abs(val1 - val2) 
+// 2. The "Chef" Logic (Only runs in the Child process)
+if (targetAddr) {
+    console.log("[+] Target found at: " + targetAddr + ". Initializing instrumentation...");
+
+    Interceptor.attach(targetAddr, {
+        onEnter: function (args) {
+            Stalker.follow(Process.getCurrentThreadId(), {
+                transform: function (iterator) {
+                    let instruction = iterator.next();
+                    while (instruction !== null) {
+                        const startAddress = instruction.address;
+                        
+                        // AFL-style Edge Coverage logic
+                        const location = (startAddress.toInt32() >> 4) ^ (startAddress.toInt32() << 8);
+                        const index = (location ^ prev_location) % MAP_SIZE;
+
+                        iterator.putCallout((context) => {
+                            if (coverage_map[index] === 0) {
+                                coverage_map[index] = 1;
+                                send({ type: 'new_block', address: startAddress });
+                            }
                         });
-                    } catch (e) {}
-                });
-            }
-            iterator.keep();
-            instruction = iterator.next();
+
+                        prev_location = location >> 1;
+                        iterator.keep();
+                        instruction = iterator.next();
+                    }
+                }
+            });
+        },
+        onLeave: function (retval) {
+            Stalker.unfollow(Process.getCurrentThreadId());
+            Stalker.flush();
         }
-    }
-});
+    });
+
+    // 3. The "Real" Fuzz Export
+    rpc.exports = {
+        fuzz: function (payload) {
+            const native_func = new NativeFunction(targetAddr, 'void', ['pointer', 'int']);
+            const buffer = Memory.alloc(payload.length);
+            buffer.writeByteArray(payload);
+            
+            try {
+                native_func(buffer, payload.length);
+            } catch (e) {
+                send({ type: 'crash', error: e.message });
+            }
+        }
+    };
+} else {
+    // 4. The "Dummy" Logic (Runs in the Parent process)
+    // We must export the function name so Python's rpc.exports doesn't throw an error,
+    // but it won't actually do anything until the child process is active.
+    rpc.exports = {
+        fuzz: function (payload) {
+            // Do nothing in the bootloader
+            return;
+        }
+    };
+}
