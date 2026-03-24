@@ -1,8 +1,20 @@
 ## To run main (Recommended to build in venv)
+
+### Windows
+```cmd
 py -m venv venv  
-npm build  
-.\venv\Scripts\Activate.ps1  
-py run fuzzer_script.py   
+.\venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+python fuzzer_script.py
+```
+
+### Linux / WSL / macOS
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+python3 fuzzer_script.py
+```
 
 # Expected Outputs
 logs folder containing bugs_count.csv and traceback.log

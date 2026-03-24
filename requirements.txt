@@ -1,0 +1,4 @@
+numpy
+frida
+frida-tools
+psutil
