@@ -2,3 +2,7 @@
 /package.json
 /temp store corpus
 /venv
+/corpus
+/crashes
+/logs
+/corpus_temp
