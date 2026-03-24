@@ -1,42 +1,60 @@
 // fuzzer_hook.js
 const seen_edges = new Set();
-let prev_block = "0";
+const prevBlock = new Map(); // threadId -> last block address string (per-thread)
 
-// DELETE OR COMMENT OUT ALL MODULE FILTERING LOGIC
-// We want to see IF we can get any blocks at all.
-function isMainModule(addr) {
-    return true; 
+// Batch outgoing messages to reduce IPC round-trips with Python
+const pendingEdges = [];
+const pendingCmps = [];
+let flushScheduled = false;
+
+function scheduledFlush() {
+    flushScheduled = false;
+    if (pendingEdges.length > 0)
+        send({ type: 'batch_edges', edges: pendingEdges.splice(0) });
+    if (pendingCmps.length > 0)
+        send({ type: 'batch_cmps', entries: pendingCmps.splice(0) });
+}
+
+function scheduleFlush() {
+    if (!flushScheduled) {
+        flushScheduled = true;
+        setTimeout(scheduledFlush, 50);
+    }
 }
 
 Stalker.follow({
-    events: { block: true },
-    onReceive: function (events) {
-        const blocks = Stalker.parse(events);
-        blocks.forEach(b => {
-            let currStr = b[0].toString();
-            let edge = prev_block + "->" + currStr;
-            if (!seen_edges.has(edge)) {
-                seen_edges.add(edge);
-                send({ type: 'new_block', address: currStr });
-            }
-            prev_block = currStr;
-        });
-    },
     transform: function (iterator) {
         let instruction = iterator.next();
+        if (instruction === null) return;
+
+        // Capture block start address at compile time
+        const blockAddr = instruction.address.toString();
+
+        // Insert edge-tracking callout at block entry (runs once per execution of this block)
+        iterator.putCallout((context) => {
+            const tid = Process.getCurrentThreadId().toString();
+            const prev = prevBlock.get(tid) || '0';
+            const edge = prev + '->' + blockAddr;
+            if (!seen_edges.has(edge)) {
+                seen_edges.add(edge);
+                pendingEdges.push(edge);
+                scheduleFlush();
+            }
+            prevBlock.set(tid, blockAddr);
+        });
+        iterator.keep();
+
+        // Walk remaining instructions in the block, instrumenting CMP operands
+        instruction = iterator.next();
         while (instruction !== null) {
-            // Instrument ALL CMPs for now to verify logic
             if (instruction.mnemonic === 'cmp') {
-                const instrAddr = instruction.address;
+                const instrAddr = instruction.address.toString();
                 iterator.putCallout((context) => {
                     try {
                         let val1 = context.rax.toInt32();
                         let val2 = context.rbx.toInt32();
-                        send({ 
-                            type: 'cmp_distance', 
-                            address: instrAddr.toString(), 
-                            distance: Math.abs(val1 - val2) 
-                        });
+                        pendingCmps.push({ address: instrAddr, distance: Math.abs(val1 - val2) });
+                        scheduleFlush();
                     } catch (e) {}
                 });
             }
