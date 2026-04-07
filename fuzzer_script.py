@@ -5,6 +5,7 @@ import hashlib
 import json
 import multiprocessing as mp
 import os
+import queue
 import random
 import re
 import subprocess
@@ -194,38 +195,108 @@ operators = [
     mut_string_whitespace_noise,
 ]
 
+class PSO_MOpt:
+    def __init__(self, num_particles, dim):
+        self.num_particles = num_particles
+        self.dim = dim
 
+        # logits (better than raw probs)
+        self.positions = np.random.randn(num_particles, dim)
+        self.velocities = np.zeros((num_particles, dim))
+
+        self.pbest_positions = self.positions.copy()
+        self.pbest_scores = np.zeros(num_particles)
+
+        self.gbest_position = self.positions[0].copy()
+        self.gbest_score = -1
+
+        # PSO params
+        self.w = 0.7
+        self.c1 = 1.5
+        self.c2 = 1.5
+
+        # reward tracking (important)
+        self.current_rewards = np.zeros(num_particles)
+        self.current_counts = np.zeros(num_particles)
+
+        self.active_particle = 0
+
+    def softmax(self, x):
+        e = np.exp(x - np.max(x))
+        return e / e.sum()
+
+    def get_current_distribution(self):
+        return self.softmax(self.positions[self.active_particle])
+
+    def record_reward(self, reward):
+        i = self.active_particle
+        self.current_rewards[i] += reward
+        self.current_counts[i] += 1
+
+    def step_particle(self):
+        i = self.active_particle
+
+        if self.current_counts[i] > 0:
+            score = self.current_rewards[i] / self.current_counts[i]
+
+            # update pbest
+            if score > self.pbest_scores[i]:
+                self.pbest_scores[i] = score
+                self.pbest_positions[i] = self.positions[i].copy()
+
+            # update gbest
+            if score > self.gbest_score:
+                self.gbest_score = score
+                self.gbest_position = self.positions[i].copy()
+
+        # reset stats
+        self.current_rewards[i] = 0
+        self.current_counts[i] = 0
+
+        # move to next particle
+        self.active_particle = (self.active_particle + 1) % self.num_particles
+
+    def update_swarm(self):
+        for i in range(self.num_particles):
+            r1, r2 = np.random.rand(), np.random.rand()
+
+            self.velocities[i] = (
+                self.w * self.velocities[i]
+                + self.c1 * r1 * (self.pbest_positions[i] - self.positions[i])
+                + self.c2 * r2 * (self.gbest_position - self.positions[i])
+            )
+
+            self.positions[i] += self.velocities[i]
 class MOPT_Scheduler:
-    def __init__(self, operators, update_interval=20):
+    def __init__(self, operators, update_interval=10):
         self.operators = operators
-        self.probabilities = np.full(len(operators), 1.0 / len(operators))
-        self.successes = np.zeros(len(operators))
-        self.selections = np.zeros(len(operators))
-        self.epsilon = 0.1
-        self.update_interval = max(1, int(update_interval))
+        self.update_interval = update_interval
+        self.counter = 0
+
+        self.pso = PSO_MOpt(
+            num_particles=8,
+            dim=len(operators)
+        )
+
+        self.probabilities = np.ones(len(self.operators), dtype=float) / max(1, len(self.operators))
 
     def select_operator(self):
+        self.probabilities = self.pso.get_current_distribution()
         idx = np.random.choice(len(self.operators), p=self.probabilities)
-        self.selections[idx] += 1
         return self.operators[idx], idx
 
     def update_probabilities(self, op_idx, reward):
-        if reward > 0:
-            self.successes[op_idx] += reward
+        # ignore op_idx → PSO works on full distribution
+        self.pso.record_reward(reward)
 
-        total_selections = np.sum(self.selections)
-        if total_selections > 0 and (total_selections % self.update_interval == 0):
-            for i in range(len(self.operators)):
-                efficiency = self.successes[i] / (self.selections[i] + 1)
-                self.probabilities[i] = efficiency
-            self.probabilities += self.epsilon
-            probs_sum = self.probabilities.sum()
-            if probs_sum <= 0:
-                self.probabilities = np.full(
-                    len(self.operators), 1.0 / len(self.operators)
-                )
-            else:
-                self.probabilities /= probs_sum
+        self.counter += 1
+
+        if self.counter % self.update_interval == 0:
+            self.pso.step_particle()
+
+            # full swarm update once per cycle
+            if self.pso.active_particle == 0:
+                self.pso.update_swarm()
 
 
 class PerformanceStats:
@@ -329,14 +400,18 @@ class CoverageTracker:
         normalized = re.sub(r"\s+", " ", normalized).strip()
         return normalized
 
-    def canonicalize_bug_fields(self, bug_type, exception_type, message):
+    def canonicalize_bug_fields(self, bug_type, exception_type, message, hinted_bug_type=""):
         btype = (bug_type or "other").lower()
         etype = exception_type or "UnknownException"
         msg = (message or "").strip()
+        hinted = (hinted_bug_type or "").lower()
 
         # Collapse pyparsing location/token specifics into one semantic parser-failure bucket.
         if "parseexception" in etype.lower():
             etype = "ParseException"
+            # Preserve explicit validity labeling when provided by the target output.
+            if hinted == "validity" or btype == "validity":
+                return "validity", etype, msg or "Semantically invalid IPv4 value"
             btype = "invalidity"
             return btype, etype, "IPv4 tokenization failure"
 
@@ -364,6 +439,13 @@ class CoverageTracker:
         if not raw and exit_code == 0:
             return None, None
 
+        bug_type_hint = ""
+        bug_type_match = re.search(r"bug type\s*:\s*([a-z_]+)", raw, flags=re.IGNORECASE)
+        if bug_type_match:
+            candidate = bug_type_match.group(1).strip().lower()
+            if candidate in {"validity", "invalidity", "functional", "parse"}:
+                bug_type_hint = candidate
+
         exc_matches = re.findall(
             r"([\w\.]+(?:Error|Exception|Bug)):\s*(.+)", raw)
         file_matches = re.findall(r'File "([^\"]+)", line\s+(\d+)', raw)
@@ -389,19 +471,31 @@ class CoverageTracker:
         if file_matches:
             file_name, line_no = file_matches[-1]
 
-        bug_type = "other"
-        lowered = raw.lower()
-        if "invalidity" in lowered:
-            bug_type = "invalidity"
-        elif "functional" in lowered:
-            bug_type = "functional"
-        elif "parseexception" in lowered:
-            bug_type = "parse"
+        # Use binary-owned bug counts as a stable bug_type hint for ParseException buckets.
+        counts_hint = _lookup_bug_type_from_bug_counts(
+            exception_type,
+            message,
+            file_name,
+            line_no,
+        )
+        if counts_hint and not bug_type_hint:
+            bug_type_hint = counts_hint
+
+        bug_type = bug_type_hint or "other"
+        if bug_type == "other":
+            lowered = raw.lower()
+            if "invalidity" in lowered:
+                bug_type = "invalidity"
+            elif "functional" in lowered:
+                bug_type = "functional"
+            elif "parseexception" in lowered:
+                bug_type = "parse"
 
         bug_type, exception_type, message = self.canonicalize_bug_fields(
             bug_type,
             exception_type,
             message,
+            hinted_bug_type=bug_type_hint,
         )
 
         signature = (bug_type, exception_type,
@@ -421,6 +515,14 @@ class CoverageTracker:
 
         bug_type, exception_type, message, _, _ = signature
         text = f"{bug_type} {exception_type} {message}".lower()
+
+        # Trust the extracted bug type first to avoid downgrading validity ParseException.
+        if bug_type == "validity":
+            return "validity"
+        if bug_type == "invalidity":
+            return "invalidity"
+        if bug_type == "functional":
+            return "functional"
 
         if any(k in text for k in ["segfault", "access violation", "fatal"]):
             return "reliability"
@@ -781,9 +883,10 @@ def check_interesting(result, mem_spike, tracker, feedback, stats):
     if result.status == "error":
         return False, None, None
 
-    # Treat hangs as anomalies unless they also produced a concrete bug signature.
+    # Treat hangs as non-interesting by default on slow machines.
+    # Keep only concrete bug signatures as interesting (handled by tier-1 path above).
     if result.status == "hang" and not feedback.get("new_bug"):
-        return True, "tier_3", "timeout_anomaly"
+        return False, None, None
 
     # Tier 2: exploration progress and novel behavior.
     if tracker.new_block_found:
@@ -852,6 +955,92 @@ def _decode_input_for_log(data):
 
 BUG_REPRO_LEDGER_PATH = os.path.join("logs", "bug_repro_ledger.csv")
 _seen_repro_entries = set()
+BUG_COUNTS_PATH = os.path.join("logs", "bug_counts.csv")
+_BUG_COUNTS_INDEX = {}
+_BUG_COUNTS_MTIME = None
+
+
+def _normalize_line_no_for_match(value):
+    text = str(value or "").strip()
+    if text.endswith(".0"):
+        return text[:-2]
+    return text
+
+
+def _refresh_bug_counts_index():
+    global _BUG_COUNTS_INDEX, _BUG_COUNTS_MTIME
+
+    if not os.path.exists(BUG_COUNTS_PATH):
+        _BUG_COUNTS_INDEX = {}
+        _BUG_COUNTS_MTIME = None
+        return
+
+    try:
+        mtime = os.path.getmtime(BUG_COUNTS_PATH)
+    except Exception:
+        _BUG_COUNTS_INDEX = {}
+        _BUG_COUNTS_MTIME = None
+        return
+
+    if _BUG_COUNTS_MTIME == mtime:
+        return
+
+    index = {}
+    try:
+        with open(BUG_COUNTS_PATH, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                bug_type = str(row.get("bug_type") or "").strip().lower()
+                if bug_type not in {"validity", "invalidity", "functional", "parse"}:
+                    continue
+
+                exc_type = str(row.get("exc_type") or row.get("exception") or "").strip().lower()
+                message = str(row.get("exc_message") or row.get("message") or "").strip()
+                file_name = str(row.get("filename") or row.get("file") or "").strip()
+                line_no = _normalize_line_no_for_match(row.get("lineno") or row.get("line") or "")
+                if not exc_type or not message:
+                    continue
+
+                key = (exc_type, message, file_name, line_no)
+
+                raw_count = str(row.get("count") or "0").strip()
+                try:
+                    count = int(float(raw_count))
+                except Exception:
+                    count = 0
+
+                previous = index.get(key)
+                if previous is None:
+                    index[key] = (bug_type, count)
+                else:
+                    prev_type, prev_count = previous
+                    # If both labels appear for the same ParseException bucket,
+                    # prefer validity to avoid losing semantic-validity signals.
+                    if bug_type == "validity" and prev_type != "validity":
+                        index[key] = (bug_type, count)
+                    elif bug_type == prev_type and count >= prev_count:
+                        index[key] = (bug_type, count)
+                    elif prev_type != "validity" and count >= prev_count:
+                        index[key] = (bug_type, count)
+    except Exception:
+        index = {}
+
+    _BUG_COUNTS_INDEX = {k: v[0] for k, v in index.items()}
+    _BUG_COUNTS_MTIME = mtime
+
+
+def _lookup_bug_type_from_bug_counts(exception_type, message, file_name, line_no):
+    if (exception_type or "").strip().lower() != "parseexception":
+        return ""
+
+    _refresh_bug_counts_index()
+    key = (
+        (exception_type or "").strip().lower(),
+        (message or "").strip(),
+        (file_name or "").strip(),
+        _normalize_line_no_for_match(line_no),
+    )
+    return _BUG_COUNTS_INDEX.get(key, "")
 
 
 def _normalize_path_for_log(path):
@@ -1132,9 +1321,7 @@ def build_arg_parser():
     parser.add_argument("--mopt-update-interval", type=int, default=10,
                         help="Selections between MOPT probability updates")
     parser.add_argument("--dashboard-interval", type=int,
-                        default=5, help="Dashboard refresh interval")
-    parser.add_argument("--log-flush-interval", type=int,
-                        default=25, help="Iterations between log flushes")
+                        default=10, help="Dashboard refresh interval")
     parser.add_argument("--iterations", type=int,
                         default=0, help="0 means run forever")
     parser.add_argument("--max-corpus-size", type=int,
@@ -1157,7 +1344,7 @@ def generate_candidate(loader, scheduler, max_input_bytes):
 
 def auto_tune_runtime(args):
     # Conservative defaults when auto-tune is disabled.
-    default_timeout = 0.4
+    default_timeout = 3.0
     default_max_input = 96
     default_workers = 2
     default_inflight = 4
@@ -1165,7 +1352,7 @@ def auto_tune_runtime(args):
     cpu_logical = psutil.cpu_count(logical=True) or os.cpu_count() or 4
     cpu_physical = psutil.cpu_count(logical=False) or max(1, cpu_logical // 2)
 
-    log_friendly_timeout = 1.8 if args.binary_owns_logs else 0.4
+    log_friendly_timeout = 5.0 if args.binary_owns_logs else 3.0
 
     if not args.auto_tune:
         timeout_sec = args.timeout if args.timeout is not None else default_timeout
@@ -1190,7 +1377,7 @@ def auto_tune_runtime(args):
         worker_count = 1
         inflight_jobs = 1
         timeout_sec = args.timeout if args.timeout is not None else (
-            log_friendly_timeout if args.binary_owns_logs else 0.60)
+            log_friendly_timeout if args.binary_owns_logs else (3.0 if cpu_logical >= 8 else 4.0))
         max_input_bytes = args.max_input_bytes if args.max_input_bytes is not None else 80
     else:
         worker_count = args.worker_count if args.worker_count is not None else max(
@@ -1198,7 +1385,7 @@ def auto_tune_runtime(args):
         inflight_jobs = args.inflight_jobs if args.inflight_jobs is not None else max(
             4, worker_count * 2)
         timeout_sec = args.timeout if args.timeout is not None else (
-            log_friendly_timeout if args.binary_owns_logs else (0.60 if cpu_logical >= 8 else 0.70))
+            log_friendly_timeout if args.binary_owns_logs else (3.0 if cpu_logical >= 8 else 4.0))
         max_input_bytes = args.max_input_bytes if args.max_input_bytes is not None else 96
 
     if args.binary_owns_logs and args.worker_mode == "persistent":
@@ -1256,6 +1443,8 @@ def main():
     inflight = {}
     worker_restarts = 0
     max_worker_restarts = 3
+    consecutive_result_wait_timeouts = 0
+    max_result_wait_timeouts = 5
 
     try:
         while True:
@@ -1282,7 +1471,48 @@ def main():
             if persistent_mode:
                 try:
                     done_job_id, result = executor.get_next_result(
-                        timeout_sec=max(1.0, timeout_sec + 1.0))
+                        timeout_sec=max(1.0, timeout_sec * 2.0))
+                    consecutive_result_wait_timeouts = 0
+                except queue.Empty:
+                    # Slow targets can legitimately be late; avoid premature worker restarts.
+                    consecutive_result_wait_timeouts += 1
+                    dashboard.category_hits["result_wait_timeout"] = dashboard.category_hits.get(
+                        "result_wait_timeout", 0) + 1
+
+                    if consecutive_result_wait_timeouts <= max_result_wait_timeouts:
+                        continue
+
+                    worker_restarts += 1
+                    consecutive_result_wait_timeouts = 0
+                    dashboard.category_hits["worker_recovery"] = dashboard.category_hits.get(
+                        "worker_recovery", 0) + 1
+
+                    if hasattr(executor, "shutdown"):
+                        executor.shutdown()
+
+                    if worker_restarts > max_worker_restarts:
+                        # Fall back to sync mode to keep campaign alive.
+                        persistent_mode = False
+                        executor = CLITargetExecutor(
+                            args.target, args.input_arg, timeout_sec, work_dir)
+                        inflight_limit = 1
+                        inflight.clear()
+                        continue
+
+                    # Restart worker pool and requeue in-flight jobs.
+                    executor = PersistentWorkerPoolExecutor(
+                        args.target,
+                        args.input_arg,
+                        timeout_sec,
+                        work_dir,
+                        worker_count=worker_count,
+                    )
+                    pending = list(inflight.values())
+                    inflight.clear()
+                    for pending_op_idx, pending_input in pending:
+                        job_id = executor.submit(pending_input)
+                        inflight[job_id] = (pending_op_idx, pending_input)
+                    continue
                 except Exception:
                     # Worker queue timeout/crash recovery path.
                     worker_restarts += 1
