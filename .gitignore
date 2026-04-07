@@ -10,3 +10,5 @@ __pycache__/
 /IPv4-IPv6-parser/
 /.vscode/
 /crashes_old/
+bug_counts.csv
+tracebacks.log

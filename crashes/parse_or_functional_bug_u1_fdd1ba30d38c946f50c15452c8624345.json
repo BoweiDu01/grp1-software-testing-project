@@ -10,8 +10,8 @@
   ],
   "status": "success",
   "exit_code": 0,
-  "elapsed_sec": 3.1547532081604004,
+  "elapsed_sec": 2.7636799812316895,
   "timed_out": false,
   "command": "./win-ipv4-parser.exe --ipstr 5.0.0.0",
-  "timestamp": 1775568073
+  "timestamp": 1775570253
 }

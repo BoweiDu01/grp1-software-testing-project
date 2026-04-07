@@ -195,6 +195,7 @@ operators = [
     mut_string_whitespace_noise,
 ]
 
+
 class PSO_MOpt:
     def __init__(self, num_particles, dim):
         self.num_particles = num_particles
@@ -267,6 +268,8 @@ class PSO_MOpt:
             )
 
             self.positions[i] += self.velocities[i]
+
+
 class MOPT_Scheduler:
     def __init__(self, operators, update_interval=10):
         self.operators = operators
@@ -278,7 +281,8 @@ class MOPT_Scheduler:
             dim=len(operators)
         )
 
-        self.probabilities = np.ones(len(self.operators), dtype=float) / max(1, len(self.operators))
+        self.probabilities = np.ones(
+            len(self.operators), dtype=float) / max(1, len(self.operators))
 
     def select_operator(self):
         self.probabilities = self.pso.get_current_distribution()
@@ -440,7 +444,8 @@ class CoverageTracker:
             return None, None
 
         bug_type_hint = ""
-        bug_type_match = re.search(r"bug type\s*:\s*([a-z_]+)", raw, flags=re.IGNORECASE)
+        bug_type_match = re.search(
+            r"bug type\s*:\s*([a-z_]+)", raw, flags=re.IGNORECASE)
         if bug_type_match:
             candidate = bug_type_match.group(1).strip().lower()
             if candidate in {"validity", "invalidity", "functional", "parse"}:
@@ -967,6 +972,19 @@ def _normalize_line_no_for_match(value):
     return text
 
 
+def _normalize_exception_type_for_match(value):
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    if "." in text:
+        text = text.split(".")[-1]
+    return text
+
+
+def _normalize_file_name_for_match(value):
+    return str(value or "").strip().replace("\\", "/").lower()
+
+
 def _refresh_bug_counts_index():
     global _BUG_COUNTS_INDEX, _BUG_COUNTS_MTIME
 
@@ -994,10 +1012,16 @@ def _refresh_bug_counts_index():
                 if bug_type not in {"validity", "invalidity", "functional", "parse"}:
                     continue
 
-                exc_type = str(row.get("exc_type") or row.get("exception") or "").strip().lower()
-                message = str(row.get("exc_message") or row.get("message") or "").strip()
-                file_name = str(row.get("filename") or row.get("file") or "").strip()
-                line_no = _normalize_line_no_for_match(row.get("lineno") or row.get("line") or "")
+                exc_type = _normalize_exception_type_for_match(
+                    row.get("exc_type") or row.get("exception") or ""
+                )
+                message = str(row.get("exc_message")
+                              or row.get("message") or "").strip()
+                file_name = _normalize_file_name_for_match(
+                    row.get("filename") or row.get("file") or ""
+                )
+                line_no = _normalize_line_no_for_match(
+                    row.get("lineno") or row.get("line") or "")
                 if not exc_type or not message:
                     continue
 
@@ -1030,17 +1054,31 @@ def _refresh_bug_counts_index():
 
 
 def _lookup_bug_type_from_bug_counts(exception_type, message, file_name, line_no):
-    if (exception_type or "").strip().lower() != "parseexception":
+    exc_type = _normalize_exception_type_for_match(exception_type)
+    if exc_type != "parseexception":
         return ""
 
     _refresh_bug_counts_index()
     key = (
-        (exception_type or "").strip().lower(),
+        exc_type,
         (message or "").strip(),
-        (file_name or "").strip(),
+        _normalize_file_name_for_match(file_name),
         _normalize_line_no_for_match(line_no),
     )
-    return _BUG_COUNTS_INDEX.get(key, "")
+    exact = _BUG_COUNTS_INDEX.get(key, "")
+    if exact:
+        return exact
+
+    # Fallback when traceback file path or line formatting differs.
+    msg = (message or "").strip()
+    fallback = ""
+    for (k_exc, k_msg, _k_file, _k_line), k_type in _BUG_COUNTS_INDEX.items():
+        if k_exc == exc_type and k_msg == msg:
+            if k_type == "validity":
+                return "validity"
+            if not fallback:
+                fallback = k_type
+    return fallback
 
 
 def _normalize_path_for_log(path):
@@ -1063,6 +1101,27 @@ def _extract_signature_fields(bug_signature):
     return bug_type, exception_type, message, file_name, line_no
 
 
+def _reclassify_signature_from_bug_counts(bug_signature):
+    if not bug_signature:
+        return bug_signature
+
+    bug_type, exception_type, message, file_name, line_no = _extract_signature_fields(
+        bug_signature)
+    if not exception_type:
+        return bug_signature
+
+    counts_hint = _lookup_bug_type_from_bug_counts(
+        exception_type,
+        message,
+        file_name,
+        line_no,
+    )
+    if not counts_hint or counts_hint == bug_type:
+        return bug_signature
+
+    return (counts_hint, exception_type, message, file_name, line_no)
+
+
 def _append_bug_repro_ledger(data_hash, input_bytes, bug_signature, reason, json_path, bin_path, result, timestamp):
     os.makedirs("logs", exist_ok=True)
     file_exists = os.path.exists(BUG_REPRO_LEDGER_PATH)
@@ -1073,6 +1132,7 @@ def _append_bug_repro_ledger(data_hash, input_bytes, bug_signature, reason, json
         return
     _seen_repro_entries.add(json_ref)
 
+    bug_signature = _reclassify_signature_from_bug_counts(bug_signature)
     bug_type, exception_type, message, file_name, line_no = _extract_signature_fields(
         bug_signature)
     input_b64 = base64.b64encode(input_bytes).decode(
@@ -1215,9 +1275,11 @@ def clear_binary_owned_logs(logs_dir="logs"):
     os.makedirs(logs_dir, exist_ok=True)
     bug_csv_path = os.path.join(logs_dir, "bug_counts.csv")
 
-    # Binary owns this file but expects a readable CSV structure.
-    with open(bug_csv_path, "w", encoding="utf-8") as f:
-        f.write("bug_type,exception,message,file,line,count\n")
+    # Preserve existing bug_counts history across runs.
+    # Only initialize the file when it does not exist yet.
+    if not os.path.exists(bug_csv_path):
+        with open(bug_csv_path, "w", encoding="utf-8") as f:
+            f.write("bug_type,exception,message,file,line,count\n")
 
 
 class BlackboxCampaignDashboard:
@@ -1568,7 +1630,7 @@ def main():
                     dashboard.category_hits[reason] = dashboard.category_hits.get(
                         reason, 0) + 1
 
-                if tier == "tier_1":
+                if reason and reason.startswith("bug:"):
                     dashboard.total_bug_hits += 1
                     fingerprint = tracker.last_bug_fingerprint or hashlib.sha256(
                         (tracker.last_exception_text or "unknown").encode(
