@@ -22,9 +22,20 @@ python3 fuzzer_script.py
 
 - Uses subprocess execution against a target binary (default: `./win-ipv4-parser.exe`).
 - Default startup corpus is valid IPv4 seeds at `corpus/networking/valid_ipv4` for faster evaluation.
+- Runs each seed once before the mutation loop so boundary and baseline inputs are exercised up front.
 - Keeps MOPT probability adaptation and updates rewards from current interestingness decisions.
 - Uses general mutation operators only (no structured/domain-specific mutation).
 - Preserves dashboard style and output locations (`logs/`, `crashes/`, `corpus/`).
+
+# Corpus generation
+
+```bash
+python generatecorpus.py
+```
+
+- The generator now builds a generic preset corpus across IPv4, IPv6, JSON, and string inputs.
+- Edit `USER_CONFIG` in [generatecorpus.py](generatecorpus.py) if you want to enable or disable target families or change the profile.
+- `corpus/networking/valid_ipv4` is still kept as the default compatibility path for the fuzzer.
 
 # Common options
 
@@ -50,8 +61,9 @@ python fuzzer_script.py --no-auto-tune --timeout 0.4 --worker-count 2 --inflight
 
 # Expected Outputs
 
-- `logs/bug_counts.csv` (owned/populated by the target binary; fuzzer only clears it at startup)
+- `logs/bug_counts.csv` (owned/populated by the target binary; the fuzzer preserves it across runs if it already exists)
 - `logs/traceback.log`
+- `logs/bug_repro_ledger.csv`
 - `crashes/*.bin` and `crashes/*.json`
 
 # To run any target application (for verification of inputs)

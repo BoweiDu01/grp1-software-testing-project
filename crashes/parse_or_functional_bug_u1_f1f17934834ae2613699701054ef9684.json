@@ -1,0 +1,17 @@
+{
+  "category": "parse_or_functional_bug_u1",
+  "reason": "bug:functional",
+  "bug_signature": [
+    "functional",
+    "FunctionalBug",
+    "Invalid IPv4 calculation",
+    "buggy_ipyparse\\ipv4_stv.py",
+    "134"
+  ],
+  "status": "success",
+  "exit_code": 0,
+  "elapsed_sec": 3.0700180530548096,
+  "timed_out": false,
+  "command": "./win-ipv4-parser.exe --ipstr 0.0.0.0",
+  "timestamp": 1775572895
+}

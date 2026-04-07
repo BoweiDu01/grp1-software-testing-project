@@ -1,0 +1,17 @@
+{
+  "category": "parse_or_functional_bug_u5",
+  "reason": "bug:invalidity",
+  "bug_signature": [
+    "invalidity",
+    "InvalidityBug",
+    "Malformed IPv4 structure",
+    "buggy_ipyparse\\ipv4_stv.py",
+    "80"
+  ],
+  "status": "hang",
+  "exit_code": -1,
+  "elapsed_sec": 5.012518644332886,
+  "timed_out": true,
+  "command": "./win-ipv4-parser.exe --ipstr 193.]254.0.1",
+  "timestamp": 1775573387
+}

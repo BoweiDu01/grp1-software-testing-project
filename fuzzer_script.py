@@ -1509,6 +1509,82 @@ def main():
     max_result_wait_timeouts = 5
 
     try:
+        # Execute initial seeds once before mutation to preserve boundary/valid baselines.
+        warmup_seeds = list(loader.seeds)
+        warmup_limit = len(warmup_seeds)
+        if iteration_limit > 0:
+            warmup_limit = min(warmup_limit, iteration_limit)
+
+        if warmup_limit > 0:
+            print(
+                f"[*] Seed warmup: running {warmup_limit} initial corpus inputs once.")
+
+        # Warmup is intentionally synchronous to avoid queue timeout edge cases
+        # from persistent workers while establishing baseline seed behavior.
+        warmup_executor = CLITargetExecutor(
+            args.target,
+            args.input_arg,
+            timeout_sec,
+            work_dir,
+        )
+
+        for seed_input in warmup_seeds[:warmup_limit]:
+            result = warmup_executor.run_one(seed_input)
+
+            tracker.start_iteration()
+            feedback = tracker.ingest_execution(result)
+            mem_spike = stats.is_memory_spike(result.rss_delta_kb)
+
+            is_interesting, tier, reason = check_interesting(
+                result, mem_spike, tracker, feedback, stats)
+
+            if is_interesting:
+                dashboard.tier_hits[tier] += 1
+                if reason:
+                    dashboard.category_hits[reason] = dashboard.category_hits.get(
+                        reason, 0) + 1
+
+                if reason and reason.startswith("bug:"):
+                    dashboard.total_bug_hits += 1
+                    fingerprint = tracker.last_bug_fingerprint or hashlib.sha256(
+                        (tracker.last_exception_text or "unknown").encode(
+                            "utf-8", errors="ignore")
+                    ).hexdigest()
+                    dedup_fingerprint = fingerprint
+                    bug_type = ""
+                    if tracker.last_bug_signature and len(tracker.last_bug_signature) > 0:
+                        bug_type = str(tracker.last_bug_signature[0]).lower()
+
+                    # Keep stricter dedup only for inv/val families; preserve per-input uniqueness for others.
+                    if bug_type not in ("invalidity", "validity"):
+                        input_hash = hashlib.md5(seed_input).hexdigest()
+                        dedup_fingerprint = hashlib.sha256(
+                            f"{fingerprint}||{input_hash}".encode(
+                                "utf-8", errors="ignore")
+                        ).hexdigest()
+
+                    is_new_bug = dedup_fingerprint not in dashboard.unique_bug_fingerprints
+                    if is_new_bug:
+                        dashboard.unique_bug_fingerprints.add(
+                            dedup_fingerprint)
+                        dashboard.unique_bug_count += 1
+                        category = tracker.last_output_category
+                        if category == "none":
+                            category = "fatal_system_crash"
+                        save_crash(
+                            seed_input,
+                            f"{category}_u{dashboard.unique_bug_count}",
+                            tracker.last_bug_signature,
+                            result,
+                            reason,
+                        )
+
+            submitted += 1
+            completed += 1
+            dashboard.iterations = completed
+            if dashboard.iterations % max(1, args.dashboard_interval) == 0:
+                dashboard.show(tracker, scheduler)
+
         while True:
             if iteration_limit > 0 and submitted >= iteration_limit and not inflight:
                 break
