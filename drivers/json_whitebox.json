@@ -7,5 +7,5 @@
   "argv": ["--str-json", "@@"],
   "type": "json",
   "timeout": 10.0,
-  "seeds_dir": "seeds/json"
+  "seeds_dir": "corpus/serialization/json_valid"
 }

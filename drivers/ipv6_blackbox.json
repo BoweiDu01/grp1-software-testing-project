@@ -1,0 +1,11 @@
+{
+  "name": "ipv6_blackbox",
+  "target": "../IPv4-IPv6-parser/bin/linux-ipv6-parser",
+  "interpreter": null,
+  "engine": null,
+  "input_mode": "argv",
+  "argv": ["--ipstr", "@@"],
+  "type": "ipv6",
+  "timeout": 10.0,
+  "seeds_dir": "corpus/networking/ipv6_valid"
+}

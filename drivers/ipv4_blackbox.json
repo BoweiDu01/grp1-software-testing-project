@@ -7,5 +7,5 @@
   "argv": ["--ipstr", "@@"],
   "type": "ipv4",
   "timeout": 10.0,
-  "seeds_dir": "seeds/ipv4"
+  "seeds_dir": "corpus/networking/valid_ipv4"
 }

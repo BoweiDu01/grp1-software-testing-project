@@ -1,0 +1,11 @@
+{
+  "name": "cidrize",
+  "target": "../cidrize-runner/bin/linux-cidrize-runner",
+  "interpreter": null,
+  "engine": null,
+  "input_mode": "argv",
+  "argv": ["--func", "cidrize", "--ipstr", "@@", "--raise-errors"],
+  "type": "ipv4 and ipv6",
+  "timeout": 10.0,
+  "seeds_dir": "corpus/cidrize"
+}
