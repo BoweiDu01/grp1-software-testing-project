@@ -656,14 +656,23 @@ class ExecutionResult:
         self.command_display = command_display
 
 
-def _worker_exec_loop(binary_path, input_arg, timeout_sec, work_dir, in_q, out_q):
+def _worker_exec_loop(driver_config, timeout_sec, work_dir, in_q, out_q):
     while True:
         job = in_q.get()
         if job is None:
             break
 
         job_id, input_text = job
-        cmd = [binary_path, input_arg, input_text]
+        cmd = []
+        if driver_config.get("interpreter"):
+            cmd.append(driver_config["interpreter"])
+        cmd.append(driver_config["target"])
+        for arg in driver_config.get("argv", []):
+            if arg == "@@":
+                cmd.append(input_text)
+            else:
+                cmd.append(arg)
+
         cmd_display = " ".join(cmd)
         start = time.time()
 
@@ -735,9 +744,8 @@ def _result_from_payload(payload):
 
 
 class CLITargetExecutor:
-    def __init__(self, binary_path, input_arg, timeout_sec, work_dir):
-        self.binary_path = binary_path
-        self.input_arg = input_arg
+    def __init__(self, driver_config, timeout_sec, work_dir):
+        self.driver_config = driver_config
         self.timeout_sec = timeout_sec
         self.work_dir = work_dir
 
@@ -746,7 +754,16 @@ class CLITargetExecutor:
         if not input_text:
             input_text = "0"
 
-        cmd = [self.binary_path, self.input_arg, input_text]
+        cmd = []
+        if self.driver_config.get("interpreter"):
+            cmd.append(self.driver_config["interpreter"])
+        cmd.append(self.driver_config["target"])
+        for arg in self.driver_config.get("argv", []):
+            if arg == "@@":
+                cmd.append(input_text)
+            else:
+                cmd.append(arg)
+
         cmd_display = " ".join(cmd)
         start = time.time()
 
@@ -807,9 +824,8 @@ class CLITargetExecutor:
 
 
 class PersistentWorkerPoolExecutor:
-    def __init__(self, binary_path, input_arg, timeout_sec, work_dir, worker_count=2):
-        self.binary_path = binary_path
-        self.input_arg = input_arg
+    def __init__(self, driver_config, timeout_sec, work_dir, worker_count=2):
+        self.driver_config = driver_config
         self.timeout_sec = timeout_sec
         self.work_dir = work_dir
         self.worker_count = max(1, int(worker_count))
@@ -823,8 +839,7 @@ class PersistentWorkerPoolExecutor:
             proc = mp.Process(
                 target=_worker_exec_loop,
                 args=(
-                    self.binary_path,
-                    self.input_arg,
+                    self.driver_config,
                     self.timeout_sec,
                     self.work_dir,
                     self.in_q,
@@ -1365,17 +1380,18 @@ class BlackboxCampaignDashboard:
         print("=" * 50)
 
 
+def load_driver(driver_path: str) -> dict:
+    with open(driver_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
 def build_arg_parser():
     parser = argparse.ArgumentParser(
         description="CLI-only fuzzer with MOPT scheduling.")
+    parser.add_argument("--driver", required=True, help="Path to driver JSON")
     parser.add_argument(
-        "--target", default="./win-ipv4-parser.exe", help="Target binary path")
-    parser.add_argument("--input-arg", default="--ipstr",
-                        help="Target input argument name")
-    parser.add_argument(
-        "--corpus-dir",
-        default="corpus/networking/valid_ipv4",
-        help="Corpus directory",
+        "--seeds",
+        default=None,
+        help="Optional explicit seeds directory override",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--timeout", type=float, default=None,
@@ -1463,9 +1479,9 @@ class FullIterationLogger:
             ])
 
 
-def auto_tune_runtime(args):
+def auto_tune_runtime(args, driver_timeout):
     # Conservative defaults when auto-tune is disabled.
-    default_timeout = 3.0
+    default_timeout = driver_timeout if driver_timeout is not None else 3.0
     default_max_input = 96
     default_workers = 2
     default_inflight = 4
@@ -1473,7 +1489,7 @@ def auto_tune_runtime(args):
     cpu_logical = psutil.cpu_count(logical=True) or os.cpu_count() or 4
     cpu_physical = psutil.cpu_count(logical=False) or max(1, cpu_logical // 2)
 
-    log_friendly_timeout = 5.0 if args.binary_owns_logs else 3.0
+    log_friendly_timeout = 5.0 if args.binary_owns_logs else default_timeout
 
     if not args.auto_tune:
         timeout_sec = args.timeout if args.timeout is not None else default_timeout
@@ -1498,7 +1514,7 @@ def auto_tune_runtime(args):
         worker_count = 1
         inflight_jobs = 1
         timeout_sec = args.timeout if args.timeout is not None else (
-            log_friendly_timeout if args.binary_owns_logs else (3.0 if cpu_logical >= 8 else 4.0))
+            log_friendly_timeout if args.binary_owns_logs else (default_timeout if cpu_logical >= 8 else default_timeout + 1.0))
         max_input_bytes = args.max_input_bytes if args.max_input_bytes is not None else 80
     else:
         worker_count = args.worker_count if args.worker_count is not None else max(
@@ -1506,7 +1522,7 @@ def auto_tune_runtime(args):
         inflight_jobs = args.inflight_jobs if args.inflight_jobs is not None else max(
             4, worker_count * 2)
         timeout_sec = args.timeout if args.timeout is not None else (
-            log_friendly_timeout if args.binary_owns_logs else (3.0 if cpu_logical >= 8 else 4.0))
+            log_friendly_timeout if args.binary_owns_logs else (default_timeout if cpu_logical >= 8 else default_timeout + 1.0))
         max_input_bytes = args.max_input_bytes if args.max_input_bytes is not None else 96
 
     if args.binary_owns_logs and args.worker_mode == "persistent":
@@ -1521,20 +1537,24 @@ def main():
     args = build_arg_parser().parse_args()
     work_dir = os.getcwd()
 
+    driver_config = load_driver(args.driver)
+    corpus_dir = args.seeds or driver_config.get("seeds_dir", "corpus/")
+    driver_timeout = driver_config.get("timeout")
+
     timeout_sec, worker_count, inflight_jobs, max_input_bytes = auto_tune_runtime(
-        args)
+        args, driver_timeout)
 
     set_reproducibility(args.seed)
     if args.binary_owns_logs:
         clear_binary_owned_logs("logs")
     rebuild_bug_repro_ledger_from_crashes("crashes")
-    loader = CorpusLoader(args.corpus_dir)
+    loader = CorpusLoader(corpus_dir)
     scheduler = MOPT_Scheduler(
         operators, update_interval=args.mopt_update_interval)
     tracker = CoverageTracker()
-    full_logger = FullIterationLogger(args.target)
+    full_logger = FullIterationLogger(driver_config["target"])
     dashboard = BlackboxCampaignDashboard(
-        args.target,
+        driver_config["target"],
         args.worker_mode,
         worker_count,
         inflight_jobs,
@@ -1545,8 +1565,7 @@ def main():
     stats = PerformanceStats()
     if args.worker_mode == "persistent":
         executor = PersistentWorkerPoolExecutor(
-            args.target,
-            args.input_arg,
+            driver_config,
             timeout_sec,
             work_dir,
             worker_count=worker_count,
@@ -1555,7 +1574,7 @@ def main():
         persistent_mode = True
     else:
         executor = CLITargetExecutor(
-            args.target, args.input_arg, timeout_sec, work_dir)
+            driver_config, timeout_sec, work_dir)
         inflight_limit = 1
         persistent_mode = False
 
@@ -1582,8 +1601,7 @@ def main():
         # Warmup is intentionally synchronous to avoid queue timeout edge cases
         # from persistent workers while establishing baseline seed behavior.
         warmup_executor = CLITargetExecutor(
-            args.target,
-            args.input_arg,
+            driver_config,
             timeout_sec,
             work_dir,
         )
@@ -1697,15 +1715,14 @@ def main():
                         # Fall back to sync mode to keep campaign alive.
                         persistent_mode = False
                         executor = CLITargetExecutor(
-                            args.target, args.input_arg, timeout_sec, work_dir)
+                            driver_config, timeout_sec, work_dir)
                         inflight_limit = 1
                         inflight.clear()
                         continue
 
                     # Restart worker pool and requeue in-flight jobs.
                     executor = PersistentWorkerPoolExecutor(
-                        args.target,
-                        args.input_arg,
+                        driver_config,
                         timeout_sec,
                         work_dir,
                         worker_count=worker_count,
@@ -1729,15 +1746,14 @@ def main():
                         # Fall back to sync mode to keep campaign alive.
                         persistent_mode = False
                         executor = CLITargetExecutor(
-                            args.target, args.input_arg, timeout_sec, work_dir)
+                            driver_config, timeout_sec, work_dir)
                         inflight_limit = 1
                         inflight.clear()
                         continue
 
                     # Restart worker pool and requeue in-flight jobs.
                     executor = PersistentWorkerPoolExecutor(
-                        args.target,
-                        args.input_arg,
+                        driver_config,
                         timeout_sec,
                         work_dir,
                         worker_count=worker_count,

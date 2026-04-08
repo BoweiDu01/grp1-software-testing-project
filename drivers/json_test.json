@@ -1,0 +1,12 @@
+{
+  "name": "json_test",
+  "interpreter": "python3",
+  "target": "json_decoder_stv.py",
+  "argv": [
+    "--str-json",
+    "@@"
+  ],
+  "type": "json",
+  "timeout": 5.0,
+  "seeds_dir": "corpus/serialization/json_valid"
+}

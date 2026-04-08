@@ -1,0 +1,11 @@
+{
+  "name": "json_whitebox",
+  "target": "../json-decoder/json_decoder_stv.py",
+  "interpreter": "python3",
+  "engine": "python",
+  "input_mode": "argv",
+  "argv": ["--str-json", "@@"],
+  "type": "json",
+  "timeout": 10.0,
+  "seeds_dir": "seeds/json"
+}
