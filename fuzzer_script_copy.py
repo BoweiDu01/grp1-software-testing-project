@@ -1,6 +1,7 @@
 import argparse
 import base64
 import csv
+import datetime
 import hashlib
 import json
 import multiprocessing as mp
@@ -1420,7 +1421,46 @@ def generate_candidate(loader, scheduler, max_input_bytes):
         mutated_input = op(seed)
 
     mutated_input = clamp_input_size(mutated_input, max_input_bytes)
-    return op_idx, mutated_input
+    return op_idx, mutated_input, seed
+
+
+class FullIterationLogger:
+    def __init__(self, target_path):
+        os.makedirs("logs", exist_ok=True)
+        timestamp_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        binary_name = os.path.basename(target_path)
+        self.log_path = os.path.join("logs", f"{timestamp_str}_{binary_name}.csv")
+        self.file_exists = False
+
+    def log_iteration(self, iteration, seed_input, mutated_input, op_name, result, tracker, is_interesting, tier, reason):
+        bug_signature = tracker.last_bug_signature
+        bug_type, exception_type, message, file_name, line_no = _extract_signature_fields(bug_signature)
+
+        timestamp = int(time.time())
+        input_hash = hashlib.md5(mutated_input).hexdigest()
+        input_text = _decode_input_for_log(mutated_input)
+        input_b64 = base64.b64encode(mutated_input).decode("ascii")
+
+        seed_text = _decode_input_for_log(seed_input)
+        seed_b64 = base64.b64encode(seed_input).decode("ascii")
+
+        with open(self.log_path, "a", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            if not self.file_exists:
+                writer.writerow([
+                    "timestamp", "iteration", "is_interesting", "tier", "reason",
+                    "op_name", "seed_text", "mutated_text", "seed_b64", "mutated_b64",
+                    "status", "exit_code", "timed_out", "elapsed_sec", "command",
+                    "bug_type", "exception", "message", "file", "line", "input_hash"
+                ])
+                self.file_exists = True
+
+            writer.writerow([
+                timestamp, iteration, 1 if is_interesting else 0, tier or "", reason or "",
+                op_name, seed_text, input_text, seed_b64, input_b64,
+                result.status, result.exit_code, result.timed_out, f"{result.elapsed_sec:.6f}", result.command_display,
+                bug_type, exception_type, message, file_name, line_no, input_hash
+            ])
 
 
 def auto_tune_runtime(args):
@@ -1492,6 +1532,7 @@ def main():
     scheduler = MOPT_Scheduler(
         operators, update_interval=args.mopt_update_interval)
     tracker = CoverageTracker()
+    full_logger = FullIterationLogger(args.target)
     dashboard = BlackboxCampaignDashboard(
         args.target,
         args.worker_mode,
@@ -1557,6 +1598,8 @@ def main():
             is_interesting, tier, reason = check_interesting(
                 result, mem_spike, tracker, feedback, stats)
 
+            full_logger.log_iteration(completed, seed_input, seed_input, "warmup", result, tracker, is_interesting, tier, reason)
+
             if is_interesting:
                 dashboard.tier_hits[tier] += 1
                 if reason:
@@ -1614,14 +1657,15 @@ def main():
                 (iteration_limit == 0 or submitted < iteration_limit)
                 and len(inflight) < inflight_limit
             ):
-                op_idx, mutated_input = generate_candidate(
+                op_idx, mutated_input, seed_input = generate_candidate(
                     loader, scheduler, max_input_bytes)
+                op_name = operators[op_idx].__name__
                 if persistent_mode:
                     job_id = executor.submit(mutated_input)
-                    inflight[job_id] = (op_idx, mutated_input)
+                    inflight[job_id] = (op_idx, mutated_input, seed_input, op_name)
                 else:
                     result = executor.run_one(mutated_input)
-                    inflight[submitted] = (op_idx, mutated_input, result)
+                    inflight[submitted] = (op_idx, mutated_input, seed_input, op_name, result)
                 submitted += 1
 
             if not inflight:
@@ -1668,9 +1712,9 @@ def main():
                     )
                     pending = list(inflight.values())
                     inflight.clear()
-                    for pending_op_idx, pending_input in pending:
+                    for pending_op_idx, pending_input, pending_seed, pending_op_name in pending:
                         job_id = executor.submit(pending_input)
-                        inflight[job_id] = (pending_op_idx, pending_input)
+                        inflight[job_id] = (pending_op_idx, pending_input, pending_seed, pending_op_name)
                     continue
                 except Exception:
                     # Worker queue timeout/crash recovery path.
@@ -1700,19 +1744,19 @@ def main():
                     )
                     pending = list(inflight.values())
                     inflight.clear()
-                    for pending_op_idx, pending_input in pending:
+                    for pending_op_idx, pending_input, pending_seed, pending_op_name in pending:
                         job_id = executor.submit(pending_input)
-                        inflight[job_id] = (pending_op_idx, pending_input)
+                        inflight[job_id] = (pending_op_idx, pending_input, pending_seed, pending_op_name)
                     continue
 
                 if done_job_id not in inflight:
                     # Ignore stale results from previous worker generations.
                     continue
 
-                op_idx, mutated_input = inflight.pop(done_job_id)
+                op_idx, mutated_input, seed_input, op_name = inflight.pop(done_job_id)
             else:
                 done_job_id = next(iter(inflight))
-                op_idx, mutated_input, result = inflight.pop(done_job_id)
+                op_idx, mutated_input, seed_input, op_name, result = inflight.pop(done_job_id)
 
             tracker.start_iteration()
             feedback = tracker.ingest_execution(result)
@@ -1720,6 +1764,8 @@ def main():
 
             is_interesting, tier, reason = check_interesting(
                 result, mem_spike, tracker, feedback, stats)
+
+            full_logger.log_iteration(completed, seed_input, mutated_input, op_name, result, tracker, is_interesting, tier, reason)
 
             if is_interesting:
                 dashboard.tier_hits[tier] += 1
