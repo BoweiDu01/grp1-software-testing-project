@@ -1,2 +1,6 @@
 numpy
 psutil
+pandas
+matplotlib
+# jupyterlab
+# ipykernel
