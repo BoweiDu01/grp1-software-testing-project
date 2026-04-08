@@ -1,14 +1,12 @@
 import os
 import random
 import numpy as np
-import frida
 import sys
 import time
 import hashlib
-import psutil
-import threading
+import subprocess
 
-def set_reproducibility(seed_value=7):
+def set_reproducibility(seed_value=42):
     random.seed(seed_value)
     np.random.seed(seed_value)
     print(f"[*] Fuzzing with Fixed Seed: {seed_value}")
@@ -31,7 +29,7 @@ class CorpusLoader:
     def get_random_seed(self):
         return random.choice(self.seeds)
 
-# --- 2. Mutation Operators ---
+# --- 2. Structure-Aware Mutators ---
 def mut_bitflip(data):
     if not data: return data
     res = bytearray(data)
@@ -71,16 +69,62 @@ def mut_delete_chunk(data):
     del res[start:end]
     return bytes(res)
 
-operators = [mut_bitflip, mut_arithmetic, mut_interest, mut_dictionary, mut_delete_chunk]
+def mut_octet_overflow(data):
+    try:
+        ip = data.decode('ascii')
+        octets = ip.split('.')
+        if not octets: return data
+        idx = random.randint(0, len(octets) - 1)
+        edge_cases = ["255", "256", "0", "-1", "999", "4294967295", "-2147483648", "00", "01"]
+        octets[idx] = random.choice(edge_cases)
+        return ".".join(octets).encode('ascii')
+    except: return data
+
+def mut_delimiter_mess(data):
+    try:
+        ip = data.decode('ascii')
+        mutations = [ip.replace(".", "..", 1), ip.replace(".", "", 1), ip.replace(".", " ", 1), ip + ".", "." + ip]
+        return random.choice(mutations).encode('ascii')
+    except: return data
+
+def mut_type_confusion(data):
+    try:
+        ip = data.decode('ascii')
+        octets = ip.split('.')
+        if not octets: return data
+        idx = random.randint(0, len(octets) - 1)
+        confusion = ["0xc0", "0xa8", "abc", "1.2", " ", "1e3", "NaN", "None"]
+        octets[idx] = random.choice(confusion)
+        return ".".join(octets).encode('ascii')
+    except: return data
+
+def mut_length_extension(data):
+    try:
+        ip = data.decode('ascii')
+        extensions = [".1", ".1.1", "A" * 256, "%s%n%x", " /24", ":80"]
+        return (ip + random.choice(extensions)).encode('ascii')
+    except: return data
+
+def mut_truncation(data):
+    try:
+        ip = data.decode('ascii')
+        octets = ip.split('.')
+        if len(octets) > 1:
+            octets.pop(random.randint(0, len(octets) - 1))
+            return ".".join(octets).encode('ascii')
+        return ip[:-1].encode('ascii') if len(ip) > 1 else data
+    except: return data
+
+operators = [mut_bitflip, mut_arithmetic, mut_interest, mut_dictionary, mut_delete_chunk,mut_octet_overflow, mut_delimiter_mess, mut_type_confusion, mut_length_extension, mut_truncation]
 
 # --- 3. MOPT Scheduler ---
+# Window size determines how often does the scheduler update its probabilities based on recent performance.
+#If set to 10, means after 10 executions it will change the probabilities accordingly
 class MOPT_Scheduler:
-    def __init__(self, operators, window_size=100): # Lowered window size for single-thread speed
+    def __init__(self, operators, window_size=10):
         self.operators = operators
         self.num_ops = len(operators)
         self.probabilities = np.full(self.num_ops, 1.0 / self.num_ops)
-        self.total_successes = np.zeros(self.num_ops)
-        self.total_selections = np.zeros(self.num_ops)
         self.epoch_successes = np.zeros(self.num_ops)
         self.epoch_selections = np.zeros(self.num_ops)
         self.window_size = window_size
@@ -89,14 +133,12 @@ class MOPT_Scheduler:
     def select_operator(self):
         idx = np.random.choice(self.num_ops, p=self.probabilities)
         self.epoch_selections[idx] += 1
-        self.total_selections[idx] += 1
         self.iterations += 1
         return self.operators[idx], idx
 
     def update_probabilities(self, op_idx, was_interesting):
         if was_interesting:
             self.epoch_successes[op_idx] += 1
-            self.total_successes[op_idx] += 1
         
         if self.iterations % self.window_size == 0:
             efficiencies = np.zeros(self.num_ops)
@@ -115,137 +157,100 @@ class MOPT_Scheduler:
             self.epoch_successes.fill(0)
             self.epoch_selections.fill(0)
 
-# --- 4. Coverage Tracker & Dashboard ---
-class CoverageTracker:
+# --- 4. Output-State Tracker (NOW README-AWARE) ---
+class OutputTracker:
     def __init__(self):
-        self.global_blocks = set()
+        self.seen_outputs = set()
+        self.unique_bug_signatures = set()
+        self.total_crashes = 0
+        self.total_unique_behaviors = 0
+        self.total_bugs_found = 0
 
-    def check_new_coverage(self, hits):
-        new_found = False
-        for block in hits:
-            if block not in self.global_blocks:
-                self.global_blocks.add(block)
-                new_found = True
-        return new_found
+    def evaluate(self, stdout_str, stderr_str, return_code):
+        is_interesting = False
+        is_bug = False
+        
+        # Combine output to search for README bug signatures
+        combined_output = f"{stdout_str}\n{stderr_str}".strip()
+        
+        # Hash outputs to keep memory footprint tiny
+        out_hash = hashlib.md5(combined_output.encode('utf-8')).hexdigest()
+        
+        if out_hash not in self.seen_outputs:
+            self.seen_outputs.add(out_hash)
+            is_interesting = True
+            self.total_unique_behaviors += 1
+            
+            # --- THE MAGIC: Search for target-specific bug signatures ---
+            bug_keywords = ["TRACEBACK", "ParseException", "validity bug", "invalidity", "bonus"]
+            if any(keyword in combined_output for keyword in bug_keywords):
+                is_bug = True
+                self.total_bugs_found += 1
+                
+                # Try to extract just the exception line to see if it's a NEW type of bug
+                for line in combined_output.split('\n'):
+                    if "pyparsing.exceptions" in line:
+                        bug_sig = hashlib.md5(line.encode('utf-8')).hexdigest()
+                        self.unique_bug_signatures.add(bug_sig)
+                        break
 
-def save_crash(data, category="crash"):
+        # If the app exits with a non-zero code (OS-level crash, very rare for this target)
+        if return_code != 0 and return_code != 1: 
+            self.total_crashes += 1
+            is_interesting = True
+            
+        return is_interesting, is_bug, combined_output
+
+def save_bug(data, output, category="bug"):
+    os.makedirs("found_bugs", exist_ok=True)
+    data_hash = hashlib.md5(data).hexdigest()
+    with open(f"found_bugs/{category}_{data_hash}.txt", "w", encoding='utf-8') as f:
+        f.write(f"Payload: {data}\n\nTarget Output:\n{output}")
+
+def save_crash(data, output, category="crash"):
     os.makedirs("crashes", exist_ok=True)
     data_hash = hashlib.md5(data).hexdigest()
-    with open(f"crashes/{category}_{data_hash}.bin", "wb") as f:
-        f.write(data)
+    with open(f"crashes/{category}_{data_hash}.txt", "w") as f:
+        f.write(f"Payload: {data}\n\nOutput/Error:\n{output}")
 
-class FuzzerDashboard:
-    def __init__(self):
-        self.iterations = 0
-        self.start_time = time.time()
-        self.total_crashes = 0
-
-    def show(self, tracker, scheduler):
-        os.system('cls' if os.name == 'nt' else 'clear')
-        elapsed = time.time() - self.start_time
-        speed = self.iterations / elapsed if elapsed > 0 else 0
-        
-        print("="*50)
-        print(f" SEQUENTIAL FUZZER - STABLE BUILD")
-        print("="*50)
-        print(f" Executions: {self.iterations:<10} | Speed: {speed:.2f} exec/s")
-        print(f" Crashes:    {self.total_crashes:<10} | Blocks Hit: {len(tracker.global_blocks)}")
-        print("-" * 50)
-        for i, op in enumerate(scheduler.operators):
-            print(f"  {op.__name__:<18}: {scheduler.probabilities[i]:.4f}")
-        print("="*50)
-
-# --- 5. Single Execution Logic (STREAMING & DETACH DETECTION) ---
-def run_one_process(target_command, mutated_input, device, tracker):
+# --- 5. Pure Subprocess Execution ---
+def run_one_process(target_command, mutated_input):
     payload_str = mutated_input.decode('latin-1', errors='replace')
     cmd = [arg.format(payload_str) if "{}" in arg else arg for arg in target_command]
     
-    child_caught_event = threading.Event()
-    session_detached = threading.Event()
-    result = {"new_cov": False, "crashed": False}
-    
-    child_pid = [None]
-
-    # Catch the streaming coverage updates from JS
-    def on_message(message, data):
-        if message['type'] == 'send' and message['payload']['type'] == 'coverage_update':
-            hits = message['payload']['hits']
-            if tracker.check_new_coverage(hits):
-                result["new_cov"] = True
-
-    def on_child_added(child):
-        child_pid[0] = child.pid
-        try:
-            child_session = device.attach(child.pid)
-            
-            # Listen for the exact moment the process dies naturally
-            def on_detached(reason):
-                session_detached.set()
-            child_session.on('detached', on_detached)
-            
-            with open("fuzzer_hook.js", "r") as f:
-                script = child_session.create_script(f.read())
-            
-            script.on('message', on_message)
-            script.load()
-            device.resume(child.pid)
-            child_caught_event.set()
-        except Exception as e:
-            child_caught_event.set()
-
-    device.on('child-added', on_child_added)
-    parent_pid = None
-
     try:
-        parent_pid = device.spawn(cmd)
-        parent_session = device.attach(parent_pid)
-        parent_session.enable_child_gating()
-        device.resume(parent_pid)
+        # Bumped timeout to 10.0s to allow PyInstaller to extract and run
+        # Added explicit encoding so Windows CLI doesn't choke on weird bytes
+        result = subprocess.run(
+            cmd, 
+            capture_output=True, 
+            text=True, 
+            timeout=10.0, 
+            encoding='latin-1', 
+            errors='replace'
+        )
+        return result.stdout, result.stderr, result.returncode, False
         
-        # 1. Wait for the Bootloader to spawn the child
-        if child_caught_event.wait(timeout=10.0):
-            
-            # 2. Wait for the program to finish and detach naturally (Max 5 seconds)
-            is_dead = session_detached.wait(timeout=10.0)
-            
-            # If the session didn't detach within 5 seconds, it's a true hang/crash
-            if not is_dead:
-                result["crashed"] = True
-                
-        else:
-            result["crashed"] = True
-            
-    except frida.ProcessNotFoundError:
-        result["crashed"] = True
+    except subprocess.TimeoutExpired as e:
+        # If it genuinely hangs past 10 seconds, grab whatever it managed to print!
+        partial_out = e.stdout if e.stdout else "TIMEOUT"
+        partial_err = e.stderr if e.stderr else "TIMEOUT"
+        return partial_out, partial_err, -1, True
+        
     except Exception as e:
-        result["crashed"] = True
-    finally:
-        device.off('child-added', on_child_added)
-        
-        # Hard kill to prevent %TEMP% folder locking
-        if child_pid[0]:
-            try: psutil.Process(child_pid[0]).kill()
-            except: pass
-        if parent_pid:
-            try: psutil.Process(parent_pid).kill()
-            except: pass
-
-    return result["new_cov"], result["crashed"]
-
-# --- 6. Main Loop ---
-def main():
-    set_reproducibility(42)
+        return "", str(e), -1, True
     
-    # Command array. The "{}" will be replaced by the mutated input.
+# --- 6. Main Loop & Dashboard ---
+def main():
+    set_reproducibility(70)
     target_command = ["./win-ipv4-parser.exe", "--ipstr", "{}"]
     
     loader = CorpusLoader("corpus_temp")
     scheduler = MOPT_Scheduler(operators)
-    tracker = CoverageTracker()
-    dashboard = FuzzerDashboard()
-    device = frida.get_local_device()
+    tracker = OutputTracker()
+    start_time = time.time()
     
-    print("[*] Starting Sequential Process Fuzzer...")
+    print("[*] Starting Output-State Black-Box Fuzzer...")
     
     while True:
         seed = loader.get_random_seed()
@@ -254,23 +259,44 @@ def main():
         
         if not mutated_input: continue
         
-        # Run one full lifecycle of the target
-        new_cov, crashed = run_one_process(target_command, mutated_input, device, tracker)
+        # Execute natively
+        stdout, stderr, ret_code, is_timeout = run_one_process(target_command, mutated_input)
 
-        # Process Results
-        scheduler.update_probabilities(op_idx, new_cov)
+        if is_timeout:
+            tracker.total_crashes += 1
+            save_bug(mutated_input, "Process Timed Out", "hang")
+            is_interesting = True
+        else:
+            # Check for specific bugs
+            is_interesting, is_bug, combined_out = tracker.evaluate(stdout, stderr, ret_code)
+            
+            if is_bug:
+                save_bug(mutated_input, combined_out, "logic_bug")
+            elif ret_code != 0 and ret_code != 1:
+                save_bug(mutated_input, combined_out, "fatal_crash")
+
+        # Train MOPT Scheduler
+        scheduler.update_probabilities(op_idx, is_interesting)
         
-        if new_cov:
+        if is_interesting:
             loader.seeds.append(mutated_input)
             
-        if crashed:
-            dashboard.total_crashes += 1
-            save_crash(mutated_input, "crash")
-
-        # Update display (Lowered modulo so it updates visually faster since executions are slower)
-        dashboard.iterations += 1
-        if dashboard.iterations % 2 == 0:
-            dashboard.show(tracker, scheduler)
+        # Dashboard Update
+        if scheduler.iterations % 5 == 0:
+            os.system('cls' if os.name == 'nt' else 'clear')
+            elapsed = time.time() - start_time
+            speed = scheduler.iterations / elapsed if elapsed > 0 else 0
+            
+            print("="*50)
+            print(f" BLACK-BOX FUZZER - OUTPUT STATE EDITION")
+            print("="*50)
+            print(f" Executions: {scheduler.iterations:<10} | Speed: {speed:.2f} exec/s")
+            print(f" Bugs Found: {tracker.total_bugs_found:<10} | Unique Bug Types: {len(tracker.unique_bug_signatures)}")
+            print(f" OS Crashes: {tracker.total_crashes:<10} | Unique Behaviors: {tracker.total_unique_behaviors}")
+            print("-" * 50)
+            for i, operator in enumerate(scheduler.operators):
+                print(f"  {operator.__name__:<20}: {scheduler.probabilities[i]:.4f}")
+            print("="*50)
 
 if __name__ == "__main__":
     main()
