@@ -1,0 +1,17 @@
+{
+  "category": "other_output_u3",
+  "reason": "bug:bonus",
+  "bug_signature": [
+    "other",
+    "buggy_ipyparse.ipv4_stv.PerformanceBug",
+    "Performance bug has been hit!",
+    "buggy_ipyparse\\ipv4_stv.py",
+    "91"
+  ],
+  "status": "hang",
+  "exit_code": -1,
+  "elapsed_sec": 12.76512098312378,
+  "timed_out": true,
+  "command": "./win-ipv4-parser.exe --ipstr 219.201.254.250",
+  "timestamp": 1775573174
+}
