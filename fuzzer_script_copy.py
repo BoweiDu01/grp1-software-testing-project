@@ -664,8 +664,12 @@ def _worker_exec_loop(driver_config, timeout_sec, work_dir, in_q, out_q):
 
         job_id, input_text = job
         cmd = []
-        if driver_config.get("interpreter"):
-            cmd.append(driver_config["interpreter"])
+        interpreter = driver_config.get("interpreter")
+        if interpreter:
+            if isinstance(interpreter, str):
+                cmd.extend(interpreter.split())
+            elif isinstance(interpreter, list):
+                cmd.extend(interpreter)
         cmd.append(driver_config["target"])
         for arg in driver_config.get("argv", []):
             if arg == "@@":
@@ -755,8 +759,12 @@ class CLITargetExecutor:
             input_text = "0"
 
         cmd = []
-        if self.driver_config.get("interpreter"):
-            cmd.append(self.driver_config["interpreter"])
+        interpreter = self.driver_config.get("interpreter")
+        if interpreter:
+            if isinstance(interpreter, str):
+                cmd.extend(interpreter.split())
+            elif isinstance(interpreter, list):
+                cmd.extend(interpreter)
         cmd.append(self.driver_config["target"])
         for arg in self.driver_config.get("argv", []):
             if arg == "@@":
