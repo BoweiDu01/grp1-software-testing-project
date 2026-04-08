@@ -228,8 +228,98 @@ def mut_string_whitespace_noise(data):
     mutated = text[:idx] + (noise * random.randint(1, 3)) + text[idx:]
     return _mut_to_bytes(mutated)
 
+def mut_ipv6_colon_mess(data):
+    try:
+        text = data.decode('ascii')
+        if ':' not in text: return data
+        # Replace a single colon with an invalid cluster, or remove it entirely
+        mess = random.choice([":::", ": :", ";", ""])
+        # String replace with a limit of 1 to only affect one part of the IP
+        return text.replace(":", mess, 1).encode('ascii')
+    except: return data
 
-operators = [
+def mut_ipv6_zero_compression(data):
+    try:
+        text = data.decode('ascii')
+        edge_cases = [
+            text + "::",       # Trailing
+            "::" + text,       # Leading
+            text.replace(":", "::", 2), # Multiple compressions (illegal)
+            text.replace("::", ":")     # Break existing compression
+        ]
+        return random.choice(edge_cases).encode('ascii')
+    except: return data
+
+def mut_ipv6_hextet_overflow(data):
+    try:
+        text = data.decode('ascii')
+        hextets = text.split(':')
+        if not hextets: return data
+        idx = random.randint(0, len(hextets) - 1)
+        # Hex edge cases: 5 chars (invalid), negative, purely invalid chars, massive hex
+        edge_cases = ["10000", "-1", "FFFFF", "GGGG", "00000"]
+        hextets[idx] = random.choice(edge_cases)
+        return ":".join(hextets).encode('ascii')
+    except: return data    
+
+def mut_json_bracket_imbalance(data):
+    text = data.decode('utf-8', errors='ignore')
+    if not text: 
+        return data
+    idx = random.randint(0, len(text))
+    # Inject an unclosed bracket or an unexpected closing bracket
+    injection = random.choice(["{",  "}",  "[", "]", "{{", "}}", "[[", "]]"])
+    mutated = text[:idx] + injection + text[idx:]
+    return mutated.encode('utf-8')
+
+def mut_json_type_confusion(data):
+    try:
+        # Only works if the current seed is still valid JSON
+        obj = json.loads(data.decode('utf-8'))
+        
+        # Helper to recursively find and mutate a random value
+        def mutate_dict(d):
+            if not isinstance(d, dict) or not d: return d
+            k = random.choice(list(d.keys()))
+            # Type confusion: swap strings for numbers, numbers for arrays, etc.
+            confusion_vals = [999999999999999999999, "NaN", None, True, "<script>", ["nested"]]
+            d[k] = random.choice(confusion_vals)
+            return d
+            
+        if isinstance(obj, dict):
+            obj = mutate_dict(obj)
+            return json.dumps(obj).encode('utf-8')
+        return data
+    except:
+        # Fallback if seed is already corrupted
+        return mut_string_delimiter_cluster(data)
+
+def mut_json_control_chars(data):
+    text = data.decode('utf-8', errors='ignore')
+    # Find a quote to inject inside a string value
+    quote_indices = [i for i, char in enumerate(text) if char == '"']
+    if not quote_indices: return data
+    
+    idx = random.choice(quote_indices)
+    # Inject a raw hex 0x00 (Null Byte), raw newline, or raw tab
+    bad_chars = "\x00\n\t\x1b\x08"
+    mutated = text[:idx+1] + random.choice(bad_chars) + text[idx+1:]
+    return mutated.encode('utf-8')
+
+# operators = [
+#     mut_bitflip,
+#     mut_arithmetic,
+#     mut_interest,
+#     mut_dictionary,
+#     mut_delete_chunk,
+#     mut_splice,
+#     mut_string_repeat_chunk,
+#     mut_string_delimiter_cluster,
+#     mut_string_numeric_jitter,
+#     mut_string_whitespace_noise,
+# ]
+# 1. Define your base/common operators
+common_ops = [
     mut_bitflip,
     mut_arithmetic,
     mut_interest,
@@ -242,6 +332,31 @@ operators = [
     mut_string_whitespace_noise,
 ]
 
+# 2. Define format-specific operators (Add your new ones here later)
+ipv4_specific_ops = [
+    mut_octet_overflow,
+    mut_delimiter_mess,
+    mut_type_confusion,
+    mut_length_extension,
+    mut_truncation,
+]
+
+# (Placeholders for when you write them)
+ipv6_specific_ops = [mut_ipv6_colon_mess, 
+                     mut_ipv6_zero_compression, 
+                     mut_ipv6_hextet_overflow] 
+json_specific_ops = [mut_json_bracket_imbalance, 
+                     mut_json_type_confusion, 
+                     mut_json_control_chars]
+
+# 3. Create the Target Profiles dictionary
+# The '+' operator combines the lists!
+TARGET_PROFILES = {
+    "ipv4": common_ops + ipv4_specific_ops,
+    "ipv6": common_ops + ipv6_specific_ops,
+    "json": common_ops + json_specific_ops,
+    "cidr": common_ops, # Defaults to common if no specific ops exist yet
+}
 
 class PSO_MOpt:
     def __init__(self, num_particles, dim):
@@ -317,37 +432,74 @@ class PSO_MOpt:
             self.positions[i] += self.velocities[i]
 
 
-class MOPT_Scheduler:
-    def __init__(self, operators, update_interval=10):
-        self.operators = operators
+class MultiSwarm_MOPT_Scheduler:
+    def __init__(self, target_profiles, update_interval=10):
+        """
+        target_profiles: A dictionary mapping format names to their specific operators.
+        Example: 
+        {
+            "ipv4": [mut_bitflip, mut_octet_overflow, ...],
+            "json": [mut_json_shuffle, mut_key_duplicate, ...],
+        }
+        """
         self.update_interval = update_interval
-        self.counter = 0
+        self.swarms = {}
+        
+        # Initialize a separate PSO instance for each data format
+        for profile_name, operators in target_profiles.items():
+            num_ops = len(operators)
+            self.swarms[profile_name] = {
+                "pso": PSO_MOpt(num_particles=8, dim=num_ops),
+                "operators": operators,
+                "probabilities": np.ones(num_ops, dtype=float) / max(1, num_ops),
+                "counter": 0
+            }
 
-        self.pso = PSO_MOpt(
-            num_particles=8,
-            dim=len(operators)
-        )
+    def _classify_seed(self, seed_data):
+        """Quickly identify the format of the seed to route it to the right swarm."""
+        text = seed_data.decode('utf-8', errors='ignore').strip()
+        if text.startswith('{') or text.startswith('['):
+            return "json"
+        if '/' in text:
+            return "cidr"
+        if ':' in text and not text.startswith('{'):
+            return "ipv6"
+        return "ipv4"
 
-        self.probabilities = np.ones(
-            len(self.operators), dtype=float) / max(1, len(self.operators))
+    def select_operator(self, seed_data):
+        # 1. Identify which swarm owns this seed
+        profile_name = self._classify_seed(seed_data)
+        
+        # Fallback if profile doesn't exist
+        if profile_name not in self.swarms:
+            profile_name = list(self.swarms.keys())[0] 
+            
+        swarm_data = self.swarms[profile_name]
+        pso = swarm_data["pso"]
+        operators = swarm_data["operators"]
 
-    def select_operator(self):
-        self.probabilities = self.pso.get_current_distribution()
-        idx = np.random.choice(len(self.operators), p=self.probabilities)
-        return self.operators[idx], idx
+        # 2. Get the current distribution from this specific swarm
+        swarm_data["probabilities"] = pso.get_current_distribution()
+        
+        # 3. Select the operator
+        op_idx = np.random.choice(len(operators), p=swarm_data["probabilities"])
+        return operators[op_idx], op_idx, profile_name
 
-    def update_probabilities(self, op_idx, reward):
-        # ignore op_idx → PSO works on full distribution
-        self.pso.record_reward(reward)
+    def update_probabilities(self, profile_name, reward):
+        # Only update the swarm that was actually used
+        if profile_name not in self.swarms:
+            return
+            
+        swarm_data = self.swarms[profile_name]
+        pso = swarm_data["pso"]
+        
+        pso.record_reward(reward)
+        swarm_data["counter"] += 1
 
-        self.counter += 1
-
-        if self.counter % self.update_interval == 0:
-            self.pso.step_particle()
-
-            # full swarm update once per cycle
-            if self.pso.active_particle == 0:
-                self.pso.update_swarm()
+        if swarm_data["counter"] % self.update_interval == 0:
+            pso.step_particle()
+            if pso.active_particle == 0:
+                pso.update_swarm()
 
 
 class PerformanceStats:
@@ -597,6 +749,15 @@ class CoverageTracker:
         self.hook_target = result.command_display
 
         text = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+        # [NEW GREYBOX LOGIC] Hunt for the target's actual branch coverage!
+        coverage_match = re.search(r"branch coverage\s*:\s*([\d.]+)%", text)
+        if coverage_match:
+            actual_coverage = float(coverage_match.group(1))
+            
+            # If the coverage percentage goes UP, it's an incredible mutation!
+            if actual_coverage > getattr(self, 'best_actual_coverage', 0.0):
+                self.best_actual_coverage = actual_coverage
+                self.new_block_found = True # Force the fuzzer to reward this!
         normalized_lines = []
         if text:
             for line in text.splitlines():
@@ -1354,6 +1515,12 @@ class BlackboxCampaignDashboard:
         self.unique_bug_fingerprints = set()
         self.tier_hits = {"tier_1": 0, "tier_2": 0, "tier_3": 0}
         self.category_hits = {}
+        self.profile_stats = {
+            "ipv4": {"executions": 0, "rewards": 0, "max_depth": 0},
+            "ipv6": {"executions": 0, "rewards": 0, "max_depth": 0},
+            "json": {"executions": 0, "rewards": 0, "max_depth": 0},
+            "cidr": {"executions": 0, "rewards": 0, "max_depth": 0},
+        }
 
     def show(self, tracker, scheduler):
         os.system("cls" if os.name == "nt" else "clear")
@@ -1386,11 +1553,21 @@ class BlackboxCampaignDashboard:
             f" Tier1: {self.tier_hits['tier_1']:<4} Tier2: {self.tier_hits['tier_2']:<4} Tier3: {self.tier_hits['tier_3']:<4}"
         )
         print(f" MOPT UpdateEvery: {scheduler.update_interval:<4} selections")
-        print("-" * 50)
-        for i, op in enumerate(scheduler.operators):
-            print(f"  {op.__name__:<18}: {scheduler.probabilities[i]:.6f}")
+        print(" [TARGET FORMAT PROFILER]")
+        print(f" {'Format':<8} | {'Executions':<10} | {'Rewards':<8} | {'Max Depth':<10} | {'Hit Rate'}")
+        for fmt, stats in self.profile_stats.items():
+            execs = stats['executions']
+            rwds = stats['rewards']
+            depth = stats['max_depth']
+            rate = (rwds / execs * 100) if execs > 0 else 0.0
+            print(f" {fmt.upper():<8} | {execs:<10} | {rwds:<8} | {depth:<10} | {rate:.2f}%")
         print("=" * 50)
-
+        for profile_name, swarm_data in scheduler.swarms.items():
+            print(f" [Swarm Profile: {profile_name.upper()}]")
+            for i, op in enumerate(swarm_data["operators"]):
+                print(f"   {op.__name__:<28}: {swarm_data['probabilities'][i]:.6f}")
+            print("- " * 25)
+        print("=" * 50)
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(
@@ -1440,15 +1617,18 @@ def build_arg_parser():
 
 def generate_candidate(loader, scheduler, max_input_bytes):
     seed = loader.get_random_seed()
-    op, op_idx = scheduler.select_operator()
+    
+    # The scheduler requires the seed to know WHICH swarm to use
+    op, op_idx, profile_name = scheduler.select_operator(seed)
 
+    # mut_splice requires TWO seeds to combine them
     if op == mut_splice:
         mutated_input = op(seed, loader.get_random_seed())
     else:
         mutated_input = op(seed)
 
     mutated_input = clamp_input_size(mutated_input, max_input_bytes)
-    return op_idx, mutated_input
+    return op_idx, profile_name, mutated_input
 
 
 def auto_tune_runtime(args):
@@ -1517,8 +1697,8 @@ def main():
         clear_binary_owned_logs("logs")
     rebuild_bug_repro_ledger_from_crashes("crashes")
     loader = CorpusLoader(args.corpus_dir)
-    scheduler = MOPT_Scheduler(
-        operators, update_interval=args.mopt_update_interval)
+    scheduler = MultiSwarm_MOPT_Scheduler(
+        TARGET_PROFILES, update_interval=args.mopt_update_interval)
     tracker = CoverageTracker()
     dashboard = BlackboxCampaignDashboard(
         args.target,
@@ -1558,6 +1738,7 @@ def main():
     try:
         # Execute initial seeds once before mutation to preserve boundary/valid baselines.
         warmup_seeds = list(loader.seeds)
+        random.shuffle(warmup_seeds)
         warmup_limit = len(warmup_seeds)
         if iteration_limit > 0:
             warmup_limit = min(warmup_limit, iteration_limit)
@@ -1584,6 +1765,20 @@ def main():
 
             is_interesting, tier, reason = check_interesting(
                 result, mem_spike, tracker, feedback, stats)
+            
+            # [NEW] Classify the seed manually so we have a profile_name for the tracker!
+            profile_name = scheduler._classify_seed(seed_input)
+
+            # --- NEW STATS TRACKING CODE GOES HERE ---
+            if hasattr(dashboard, 'profile_stats') and profile_name in dashboard.profile_stats:
+                dashboard.profile_stats[profile_name]["executions"] += 1
+                if is_interesting:
+                    dashboard.profile_stats[profile_name]["rewards"] += 1
+                
+                # Track the deepest path this format has ever reached
+                if tracker.path_depth > dashboard.profile_stats[profile_name]["max_depth"]:
+                    dashboard.profile_stats[profile_name]["max_depth"] = tracker.path_depth
+            # ----------------------------------------
 
             if is_interesting:
                 dashboard.tier_hits[tier] += 1
@@ -1640,16 +1835,15 @@ def main():
                 (iteration_limit == 0 or submitted < iteration_limit)
                 and len(inflight) < inflight_limit
             ):
-                op_idx, mutated_input = generate_candidate(
+                op_idx, profile_name, mutated_input = generate_candidate(
                     loader, scheduler, max_input_bytes)
                 if persistent_mode:
                     job_id = executor.submit(mutated_input)
-                    inflight[job_id] = (op_idx, mutated_input)
+                    inflight[job_id] = (op_idx, profile_name, mutated_input)
                 else:
                     result = executor.run_one(mutated_input)
-                    inflight[submitted] = (op_idx, mutated_input, result)
+                    inflight[submitted] = (op_idx, profile_name, mutated_input, result)
                 submitted += 1
-
             if not inflight:
                 continue
 
@@ -1694,9 +1888,9 @@ def main():
                     )
                     pending = list(inflight.values())
                     inflight.clear()
-                    for pending_op_idx, pending_input in pending:
+                    for pending_op_idx, pending_profile, pending_input in pending:
                         job_id = executor.submit(pending_input)
-                        inflight[job_id] = (pending_op_idx, pending_input)
+                        inflight[job_id] = (pending_op_idx, pending_profile, pending_input)
                     continue
                 except Exception:
                     # Worker queue timeout/crash recovery path.
@@ -1726,19 +1920,19 @@ def main():
                     )
                     pending = list(inflight.values())
                     inflight.clear()
-                    for pending_op_idx, pending_input in pending:
+                    for pending_op_idx, pending_profile, pending_input in pending:
                         job_id = executor.submit(pending_input)
-                        inflight[job_id] = (pending_op_idx, pending_input)
+                        inflight[job_id] = (pending_op_idx, pending_profile, pending_input)
                     continue
 
                 if done_job_id not in inflight:
                     # Ignore stale results from previous worker generations.
                     continue
 
-                op_idx, mutated_input = inflight.pop(done_job_id)
+                op_idx, profile_name, mutated_input = inflight.pop(done_job_id)
             else:
                 done_job_id = next(iter(inflight))
-                op_idx, mutated_input, result = inflight.pop(done_job_id)
+                op_idx, profile_name, mutated_input, result = inflight.pop(done_job_id)
 
             tracker.start_iteration()
             feedback = tracker.ingest_execution(result)
@@ -1746,6 +1940,16 @@ def main():
 
             is_interesting, tier, reason = check_interesting(
                 result, mem_spike, tracker, feedback, stats)
+            
+            if hasattr(dashboard, 'profile_stats') and profile_name in dashboard.profile_stats:
+                dashboard.profile_stats[profile_name]["executions"] += 1
+                if is_interesting:
+                    dashboard.profile_stats[profile_name]["rewards"] += 1
+                
+                # Track the deepest path this format has ever reached
+                if tracker.path_depth > dashboard.profile_stats[profile_name]["max_depth"]:
+                    dashboard.profile_stats[profile_name]["max_depth"] = tracker.path_depth
+            # -----------------------------------------
 
             if is_interesting:
                 dashboard.tier_hits[tier] += 1
@@ -1790,10 +1994,10 @@ def main():
                 else:
                     loader.add_seed(mutated_input, args.max_corpus_size)
 
-                scheduler.update_probabilities(
-                    op_idx, mutation_reward(tier, reason))
+                reward = mutation_reward(tier, reason)
+                scheduler.update_probabilities(profile_name, reward)
             else:
-                scheduler.update_probabilities(op_idx, 0.0)
+                scheduler.update_probabilities(profile_name, 0.0)
 
             completed += 1
             dashboard.iterations = completed
