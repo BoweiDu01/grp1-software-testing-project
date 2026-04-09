@@ -1,0 +1,17 @@
+{
+  "category": "parse_or_functional_bug_u4",
+  "reason": "bug:invalidity",
+  "bug_signature": [
+    "invalidity",
+    "InvalidityBug",
+    "Malformed IPv4 structure",
+    "buggy_ipyparse\\ipv6_mstv.py",
+    "132"
+  ],
+  "status": "hang",
+  "exit_code": -1,
+  "elapsed_sec": 5.653695106506348,
+  "timed_out": true,
+  "command": "./win-ipv6-parser.exe --ipstr ffff:fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+  "timestamp": 1775681853
+}

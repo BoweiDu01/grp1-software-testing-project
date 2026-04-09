@@ -1,0 +1,17 @@
+{
+  "category": "other_output_u3",
+  "reason": "bug:bonus",
+  "bug_signature": [
+    "other",
+    "buggy_ipyparse.ipv6_mstv.ReliabilityBug",
+    "Incorrect token length.",
+    "buggy_ipyparse\\ipv6_mstv.py",
+    "126"
+  ],
+  "status": "hang",
+  "exit_code": -1,
+  "elapsed_sec": 6.212265491485596,
+  "timed_out": true,
+  "command": "./win-ipv6-parser.exe --ipstr 2001:::1",
+  "timestamp": 1775677946
+}

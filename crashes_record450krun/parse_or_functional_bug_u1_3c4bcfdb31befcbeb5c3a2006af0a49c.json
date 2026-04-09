@@ -1,0 +1,17 @@
+{
+  "category": "parse_or_functional_bug_u1",
+  "reason": "bug:invalidity",
+  "bug_signature": [
+    "invalidity",
+    "ParseException",
+    "IPv4 tokenization failure",
+    "pyparsing\\core.py",
+    "1340"
+  ],
+  "status": "hang",
+  "exit_code": -1,
+  "elapsed_sec": 5.397850513458252,
+  "timed_out": true,
+  "command": "./win-ipv6-parser.exe --ipstr 214.253.210.207",
+  "timestamp": 1775676245
+}
