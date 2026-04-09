@@ -1,0 +1,7 @@
+target,start_time,end_time,duration_sec,iterations,throughput_exec_per_sec,worker_mode,worker_count,timeout_sec,max_input_bytes
+../json-decoder/json_decoder_stv.py,2026-04-09T07:11:24.207934,2026-04-09T07:12:28.170885,63.962960,200,3.126810,persistent,1,5.0,96
+../json-decoder/json_decoder_stv.py,2026-04-09T07:15:06.906434,2026-04-09T07:41:35.763113,1588.856686,5000,3.146917,persistent,1,5.0,96
+../IPv4-IPv6-parser/bin/linux-ipv4-parser,2026-04-09T08:00:59.713113,2026-04-09T08:04:55.386731,235.673630,200,0.848631,persistent,1,5.0,96
+../IPv4-IPv6-parser/bin/linux-ipv4-parser,2026-04-09T08:05:50.622892,2026-04-09T09:26:02.984575,4812.361691,5000,1.038991,persistent,1,5.0,96
+../cidrize-runner/bin/linux-cidrize-runner,2026-04-09T09:29:27.518990,2026-04-09T10:54:31.876259,5104.357268,5000,0.979555,persistent,1,5.0,96
+../IPv4-IPv6-parser/bin/linux-ipv6-parser,2026-04-09T11:54:23.558824,2026-04-09T13:20:12.929269,5149.370380,5000,0.970992,persistent,1,5.0,96
