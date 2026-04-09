@@ -1167,12 +1167,19 @@ def _reclassify_signature_from_bug_counts(bug_signature):
 def _append_bug_repro_ledger(data_hash, input_bytes, bug_signature, reason, json_path, bin_path, result, timestamp):
     os.makedirs("logs", exist_ok=True)
     file_exists = os.path.exists(BUG_REPRO_LEDGER_PATH)
-    json_ref = _normalize_path_for_log(json_path)
+    # json_ref = _normalize_path_for_log(json_path)
 
-    # Keep one row per crash artifact for clean triage.
-    if json_ref in _seen_repro_entries:
+    # # Keep one row per crash artifact for clean triage.
+    # if json_ref in _seen_repro_entries:
+    #     return
+    # _seen_repro_entries.add(json_ref)
+
+    json_ref = _normalize_path_for_log(json_path) if json_path else ""
+    dedup_key = json_ref if json_ref else f"ledger_only::{data_hash}::{reason}"
+
+    if dedup_key in _seen_repro_entries:
         return
-    _seen_repro_entries.add(json_ref)
+    _seen_repro_entries.add(dedup_key)
 
     bug_signature = _reclassify_signature_from_bug_counts(bug_signature)
     bug_type, exception_type, message, file_name, line_no = _extract_signature_fields(
@@ -1286,12 +1293,14 @@ def save_crash(data, category, bug_signature, result, reason):
     os.makedirs("crashes", exist_ok=True)
     data_hash = hashlib.md5(data).hexdigest()
     base = f"{category}_{data_hash}"
-    bin_path = os.path.join("crashes", f"{base}.bin")
-    json_path = os.path.join("crashes", f"{base}.json")
+    # bin_path = os.path.join("crashes", f"{base}.bin")
+    # json_path = os.path.join("crashes", f"{base}.json")
+    json_path = ""
+    bin_path = ""
 
-    if not os.path.exists(bin_path):
-        with open(bin_path, "wb") as f:
-            f.write(data)
+    # if not os.path.exists(bin_path):
+    #     with open(bin_path, "wb") as f:
+    #         f.write(data)
 
     metadata = {
         "category": category,
@@ -1304,8 +1313,8 @@ def save_crash(data, category, bug_signature, result, reason):
         "command": result.command_display,
         "timestamp": int(time.time()),
     }
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, indent=2)
+    # with open(json_path, "w", encoding="utf-8") as f:
+    #     json.dump(metadata, f, indent=2)
 
     _append_bug_repro_ledger(data_hash, data, bug_signature,
                              reason, json_path, bin_path, result, metadata["timestamp"])
@@ -1456,7 +1465,7 @@ class FullIterationLogger:
         self.log_path = os.path.join("logs", f"{timestamp_str}_{binary_name}.csv")
         self.file_exists = False
 
-    def log_iteration(self, iteration, seed_input, mutated_input, op_name, result, tracker, is_interesting, tier, reason):
+    def log_iteration(self, iteration, seed_input, mutated_input, op_name, result, tracker, is_interesting, tier, reason, generation_time_sec):
         bug_signature = tracker.last_bug_signature
         bug_type, exception_type, message, file_name, line_no = _extract_signature_fields(bug_signature)
 
@@ -1474,7 +1483,7 @@ class FullIterationLogger:
                 writer.writerow([
                     "timestamp", "iteration", "is_interesting", "tier", "reason",
                     "op_name", "seed_text", "mutated_text", "seed_b64", "mutated_b64",
-                    "status", "exit_code", "timed_out", "elapsed_sec", "command",
+                    "status", "exit_code", "timed_out", "generation_time_sec","elapsed_sec", "command",
                     "bug_type", "exception", "message", "file", "line", "input_hash"
                 ])
                 self.file_exists = True
@@ -1482,7 +1491,7 @@ class FullIterationLogger:
             writer.writerow([
                 timestamp, iteration, 1 if is_interesting else 0, tier or "", reason or "",
                 op_name, seed_text, input_text, seed_b64, input_b64,
-                result.status, result.exit_code, result.timed_out, f"{result.elapsed_sec:.6f}", result.command_display,
+                result.status, result.exit_code, result.timed_out, f"{generation_time_sec:.6f}", f"{result.elapsed_sec:.6f}", result.command_display,
                 bug_type, exception_type, message, file_name, line_no, input_hash
             ])
 
@@ -1555,7 +1564,7 @@ def main():
     set_reproducibility(args.seed)
     if args.binary_owns_logs:
         clear_binary_owned_logs("logs")
-    rebuild_bug_repro_ledger_from_crashes("crashes")
+    # rebuild_bug_repro_ledger_from_crashes("crashes")
     loader = CorpusLoader(corpus_dir)
     scheduler = MOPT_Scheduler(
         operators, update_interval=args.mopt_update_interval)
@@ -1594,6 +1603,8 @@ def main():
     max_worker_restarts = 3
     consecutive_result_wait_timeouts = 0
     max_result_wait_timeouts = 5
+    campaign_start_time = time.time()
+    campaign_start_iso = datetime.datetime.now().isoformat()
 
     try:
         # Execute initial seeds once before mutation to preserve boundary/valid baselines.
@@ -1624,7 +1635,7 @@ def main():
             is_interesting, tier, reason = check_interesting(
                 result, mem_spike, tracker, feedback, stats)
 
-            full_logger.log_iteration(completed, seed_input, seed_input, "warmup", result, tracker, is_interesting, tier, reason)
+            full_logger.log_iteration(completed, seed_input, seed_input, "warmup", result, tracker, is_interesting, tier, reason, 0)
 
             if is_interesting:
                 dashboard.tier_hits[tier] += 1
@@ -1683,15 +1694,17 @@ def main():
                 (iteration_limit == 0 or submitted < iteration_limit)
                 and len(inflight) < inflight_limit
             ):
+                gen_start = time.time()
                 op_idx, mutated_input, seed_input = generate_candidate(
                     loader, scheduler, max_input_bytes)
+                gen_time = time.time() - gen_start
                 op_name = operators[op_idx].__name__
                 if persistent_mode:
                     job_id = executor.submit(mutated_input)
-                    inflight[job_id] = (op_idx, mutated_input, seed_input, op_name)
+                    inflight[job_id] = (op_idx, mutated_input, seed_input, op_name, gen_time)
                 else:
                     result = executor.run_one(mutated_input)
-                    inflight[submitted] = (op_idx, mutated_input, seed_input, op_name, result)
+                    inflight[submitted] = (op_idx, mutated_input, seed_input, op_name, gen_time, result)
                 submitted += 1
 
             if not inflight:
@@ -1777,10 +1790,10 @@ def main():
                     # Ignore stale results from previous worker generations.
                     continue
 
-                op_idx, mutated_input, seed_input, op_name = inflight.pop(done_job_id)
+                op_idx, mutated_input, seed_input, op_name, gen_time = inflight.pop(done_job_id)
             else:
                 done_job_id = next(iter(inflight))
-                op_idx, mutated_input, seed_input, op_name, result = inflight.pop(done_job_id)
+                op_idx, mutated_input, seed_input, op_name, gen_time, result = inflight.pop(done_job_id)
 
             tracker.start_iteration()
             feedback = tracker.ingest_execution(result)
@@ -1789,7 +1802,7 @@ def main():
             is_interesting, tier, reason = check_interesting(
                 result, mem_spike, tracker, feedback, stats)
 
-            full_logger.log_iteration(completed, seed_input, mutated_input, op_name, result, tracker, is_interesting, tier, reason)
+            full_logger.log_iteration(completed, seed_input, mutated_input, op_name, result, tracker, is_interesting, tier, reason, gen_time)
 
             if is_interesting:
                 dashboard.tier_hits[tier] += 1
@@ -1858,6 +1871,46 @@ def main():
 
     dashboard.show(tracker, scheduler)
     print("[*] Fuzzing session complete.")
+
+    #end logs
+    campaign_end_time = time.time()
+    campaign_end_iso = datetime.datetime.now().isoformat()
+    campaign_total_sec = campaign_end_time - campaign_start_time
+
+    os.makedirs("logs", exist_ok=True)
+    summary_path = os.path.join("logs", "campaign_summary.csv")
+
+    file_exists = os.path.exists(summary_path)
+
+    with open(summary_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+
+        if not file_exists:
+            writer.writerow([
+                "target",
+                "start_time",
+                "end_time",
+                "duration_sec",
+                "iterations",
+                "throughput_exec_per_sec",
+                "worker_mode",
+                "worker_count",
+                "timeout_sec",
+                "max_input_bytes"
+            ])
+
+        writer.writerow([
+            driver_config["target"],
+            campaign_start_iso,
+            campaign_end_iso,
+            f"{campaign_total_sec:.6f}",
+            completed,
+            f"{(completed / campaign_total_sec) if campaign_total_sec > 0 else 0:.6f}",
+            args.worker_mode,
+            worker_count,
+            timeout_sec,
+            max_input_bytes
+        ])
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 python3 fuzzer_script.py
+python3 fuzzer_script_copy.py --driver ./drivers/ipv4_blackbox.json
 ```
 
 # CLI-only runtime notes
