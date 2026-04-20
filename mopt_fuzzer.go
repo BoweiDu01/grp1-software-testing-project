@@ -49,6 +49,35 @@ var (
 	Dictionary      = []string{"::", "0.0.0.0", "127.0.0.1", "ff02::1", "::ffff:192.168.1.1", "{}", "[]", "null", "/24", "/128", "%eth0"}
 )
 
+var SurgicalOps = []Mutation{
+	{"bit_nudge", func(data []byte, _ [][]byte, r *rand.Rand) []byte {
+		if len(data) == 0 { return data }
+		res := make([]byte, len(data))
+		copy(res, data)
+		pos := r.Intn(len(res))
+		res[pos] ^= 1 << uint(r.Intn(8))
+		return res
+	}},
+	{"byte_nudge", mutByteNudge},
+	{"arith_nudge", func(data []byte, _ [][]byte, r *rand.Rand) []byte {
+		parts := tokenize(data)
+		indices := []int{}
+		for i, t := range parts {
+			if i%2 == 0 && t != "" {
+				if _, err := strconv.ParseInt(t, 10, 64); err == nil {
+					indices = append(indices, i)
+				}
+			}
+		}
+		if len(indices) == 0 { return data }
+		idx := indices[r.Intn(len(indices))]
+		val, _ := strconv.ParseInt(parts[idx], 10, 64)
+		val += int64([]int{-1, 1}[r.Intn(2)])
+		parts[idx] = strconv.FormatInt(val, 10)
+		return reconstruct(parts)
+	}},
+}
+
 // ---------------------------------------------------------------------------
 // Data Structures
 // ---------------------------------------------------------------------------
@@ -257,6 +286,8 @@ type MutationManager struct {
 	ModeStats   map[string]*StatEntry // modeName -> stats
 	ActiveModes []string
 	ModeWeights []float64
+
+	BugOpHits   map[string]int // "opName:bugSig" -> count
 }
 
 type StatEntry struct {
@@ -269,6 +300,7 @@ func NewMutationManager(blindOps []Mutation, astEngine *ASTMutationEngine) *Muta
 		BlindOps:  blindOps,
 		ASTEngine: astEngine,
 		ModeStats: make(map[string]*StatEntry),
+		BugOpHits: make(map[string]int),
 	}
 
 	numOps := len(blindOps)
@@ -421,7 +453,10 @@ func (mm *MutationManager) SelectAndMutate(data []byte, seeds [][]byte, energy i
 	copy(localModeWeights, mm.ModeWeights)
 	mm.Unlock()
 
-	numMuts := r.Intn(max(1, min(16, energy/5))) + 1
+	numMuts := 1
+	if r.Float64() < 0.2 {
+		numMuts = r.Intn(max(1, min(16, energy/5))) + 1
+	}
 	appliedOps := []string{}
 	mutated := make([]byte, len(data))
 	copy(mutated, data)
@@ -451,7 +486,7 @@ func (mm *MutationManager) SelectAndMutate(data []byte, seeds [][]byte, energy i
 	return appliedOps, mutated
 }
 
-func (mm *MutationManager) RecordResult(fullName string, reward float64) {
+func (mm *MutationManager) RecordResult(fullName string, reward float64, bugSig string) {
 	mm.Lock()
 	defer mm.Unlock()
 
@@ -459,7 +494,20 @@ func (mm *MutationManager) RecordResult(fullName string, reward float64) {
 	if len(parts) != 2 {
 		return
 	}
-	mode, _ := parts[0], parts[1]
+	mode, opName := parts[0], parts[1]
+
+	// Operator Decay: If this operator keeps finding the same bug, its reward decays.
+	if bugSig != "" {
+		key := opName + ":" + bugSig
+		mm.BugOpHits[key]++
+		hits := mm.BugOpHits[key]
+		if hits > 1 {
+			// Decay reward exponentially after the first hit
+			for i := 0; i < hits-1; i++ {
+				reward *= 0.5
+			}
+		}
+	}
 
 	s := mm.Swarms[mm.CurrentSwarmIdx]
 	s.Count++
@@ -1094,30 +1142,58 @@ func classifyBug(stdout, stderr string) (string, string, int) {
 type Evaluator struct {
 	sync.Mutex
 	CrashHitCounts map[string]int
+	SeenHashes     map[string]bool
+	ExecTimes      []float64
+	AvgExecTime    float64
 }
 
 func (e *Evaluator) Evaluate(res *ExecutionResult, data []byte) (int, string, string) {
-	if res.TimedOut {
-		return 0, "", ""
-	}
+	h := sha256.Sum256(data)
+	dataHash := hex.EncodeToString(h[:])
+
+	e.Lock()
+	defer e.Unlock()
+
+	// 1. Check for Crashes
 	if res.IsError {
 		cat, exc, _ := classifyBug(res.Stdout, res.Stderr)
 		sig := hex.EncodeToString(sha256.New().Sum([]byte(fmt.Sprintf("%s:%s", cat, exc))))
 		
-		e.Lock()
 		e.CrashHitCounts[sig]++
 		count := e.CrashHitCounts[sig]
-		e.Unlock()
 		
 		if count == 1 {
 			return 1, "new_crash", sig
 		}
-		
 		if count <= 128 && (count&(count-1)) == 0 {
 			return 2, "stable_crash", sig
 		}
 		return 0, "", sig
 	}
+
+	// 2. Prevent duplicate processing of the same mutation data
+	if e.SeenHashes[dataHash] {
+		return 0, "", ""
+	}
+	e.SeenHashes[dataHash] = true
+
+	// 3. Tier 3: Performance Outliers (Interestingness feedback)
+	e.ExecTimes = append(e.ExecTimes, res.ExecTimeMs)
+	if len(e.ExecTimes) > 50 {
+		// Calculate a rolling average for the last 50 runs
+		sum := 0.0
+		startIdx := len(e.ExecTimes) - 50
+		for _, t := range e.ExecTimes[startIdx:] {
+			sum += t
+		}
+		e.AvgExecTime = sum / 50.0
+
+		// If it takes > 5x the average, it's a performance outlier
+		if res.ExecTimeMs > e.AvgExecTime*5.0 && e.AvgExecTime > 0.1 {
+			return 3, "performance_outlier", dataHash
+		}
+	}
+
 	return 0, "", ""
 }
 
@@ -1448,7 +1524,11 @@ func main() {
 	}
 
 	mm := NewMutationManager(blindOps, astEngine)
-	eval := &Evaluator{CrashHitCounts: make(map[string]int)}
+	eval := &Evaluator{
+		CrashHitCounts: make(map[string]int),
+		SeenHashes:     make(map[string]bool),
+		ExecTimes:      make([]float64, 0),
+	}
 	logger := NewLogger(config.Name)
 	if logger != nil {
 		defer logger.File.Close()
@@ -1522,18 +1602,41 @@ func main() {
 				}
 			} else if tier == 2 {
 				reward = 10.0
+			} else if tier == 3 {
+				reward = 50.0 // Performance outliers are very rewarding
 			}
 
 			for _, op := range res.Ops {
-				mm.RecordResult(op, reward)
+				mm.RecordResult(op, reward, sig)
 			}
 
 			currentCount := int(atomic.AddInt64(&count, 1))
 			logger.Log(currentCount, tier, sigType, res.Ops, res.Seed.Data, res.Mutated, res.ExecRes, config)
 
 			if tier > 0 {
+				cat, exc, _ := classifyBug(res.ExecRes.Stdout, res.ExecRes.Stderr)
+
 				if tier == 1 {
-					fmt.Printf("  [+] Exploitation Phase Triggered for %s\n", sig)
+					// Vulnerability Refinement Queueing: 
+					// Add hard crashes back to queue with High Energy, deduplicated by Exception Name.
+					if cat != "invalidity" && exc != "ParseException" {
+						queueMutex.Lock()
+						exists := false
+						for _, s := range seedQueue {
+							if s.Tier == 1 && s.Sig == exc {
+								exists = true
+								break
+							}
+						}
+						if !exists {
+							seedQueue = append(seedQueue, &SeedEntry{
+								Data: res.Mutated, Energy: HighEnergy, Tier: 1, Sig: exc,
+							})
+						}
+						queueMutex.Unlock()
+					}
+
+					fmt.Printf("  [+] Exploitation Phase Triggered for %s (%s)\n", sig, exc)
 					wg.Add(1)
 					go func(exploCtx context.Context, baseData []byte, baseSig string, baseSeedData []byte, c int) {
 						defer wg.Done()
@@ -1546,9 +1649,7 @@ func main() {
 
 						for j := 0; j < 500; j++ {
 							if exploCtx.Err() != nil { break }
-							mm.Lock()
-							op := mm.BlindOps[r.Intn(len(mm.BlindOps))]
-							mm.Unlock()
+							op := SurgicalOps[r.Intn(len(SurgicalOps))]
 
 							mutated := op.Func(baseData, [][]byte{}, r)
 							execRes := executeTarget(exploCtx, config, mutated, exploitDir, originalDir)
@@ -1556,8 +1657,8 @@ func main() {
 							
 							lReward := 0.0
 							if lTier == 1 {
-								cat, exc, _ := classifyBug(execRes.Stdout, execRes.Stderr)
-								if cat == "invalidity" || exc == "ParseException" {
+								lCat, lExc, _ := classifyBug(execRes.Stdout, execRes.Stderr)
+								if lCat == "invalidity" || lExc == "ParseException" {
 									lReward = 1.0
 								} else {
 									lReward = 100.0
@@ -1568,20 +1669,22 @@ func main() {
 							
 							logger.Log(c, lTier, "exploitation", []string{"exploitation", op.Name}, baseSeedData, mutated, execRes, config)
 							if lTier > 0 {
-								mm.RecordResult("blind:"+op.Name, lReward)
+								mm.RecordResult("blind:"+op.Name, lReward, lSig)
 								if lTier == 1 {
 									fmt.Printf("      [*] Local exploitation found NEW bug: %s\n", lSig)
 								}
 							}
 						}
 					}(ctx, res.Mutated, sig, res.Seed.Data, currentCount)
+				} else if tier == 3 {
+					// Performance Outlier: Add to queue with Medium Energy
+					queueMutex.Lock()
+					seedQueue = append(seedQueue, &SeedEntry{
+						Data: res.Mutated, Energy: StableEnergy, Tier: 3, Sig: sig,
+					})
+					queueMutex.Unlock()
+					fmt.Printf("  [*] Found Performance Outlier: %s (Energy: %d)\n", sig[:8], StableEnergy)
 				}
-			} else if !res.ExecRes.TimedOut && res.ExecRes.ExitCode == 0 {
-				queueMutex.Lock()
-				seedQueue = append(seedQueue, &SeedEntry{
-					Data: res.Mutated, Energy: DefaultEnergy, Tier: 0,
-				})
-				queueMutex.Unlock()
 			}
 
 			if currentCount > 0 && currentCount%1000 == 0 {
