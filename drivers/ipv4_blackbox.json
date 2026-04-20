@@ -1,0 +1,9 @@
+{
+  "name": "ipv4_blackbox",
+  "target": "./mac-ipv4-parser",
+  "input_mode": "argv",
+  "argv": ["--ipstr", "@@"],
+  "type": "ipv4",
+  "timeout": 30.0,
+  "seeds_dir": "corpus/networking/ipv4"
+}

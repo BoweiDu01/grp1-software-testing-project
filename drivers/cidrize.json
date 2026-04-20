@@ -1,0 +1,9 @@
+{
+  "name": "cidrize",
+  "target": "./mac-cidrize-runner",
+  "input_mode": "argv",
+  "argv": ["--func", "cidrize", "--ipstr", "@@", "--raise-errors"],
+  "type": "cidrize",
+  "timeout": 60.0,
+  "seeds_dir": "corpus/networking/cidr_mixed"
+}

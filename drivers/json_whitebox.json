@@ -1,0 +1,11 @@
+{
+  "name": "json_whitebox",
+  "target": "../json-decoder/json_decoder_stv.py",
+  "interpreter": "./venv/bin/python", 
+  "engine": "python",
+  "input_mode": "argv",
+  "argv": ["--str-json", "@@"],
+  "type": "json",
+  "timeout": 20.0,
+  "seeds_dir": "corpus/serialization/json_valid"
+}
