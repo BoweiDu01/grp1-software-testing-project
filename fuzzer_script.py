@@ -318,7 +318,8 @@ def mut_json_control_chars(data):
 #     mut_string_numeric_jitter,
 #     mut_string_whitespace_noise,
 # ]
-# 1. Define your base/common operators
+
+# Define your base/common operators
 common_ops = [
     mut_bitflip,
     mut_arithmetic,
@@ -332,7 +333,6 @@ common_ops = [
     mut_string_whitespace_noise,
 ]
 
-# 2. Define format-specific operators (Add your new ones here later)
 ipv4_specific_ops = [
     mut_octet_overflow,
     mut_delimiter_mess,
@@ -340,8 +340,6 @@ ipv4_specific_ops = [
     mut_length_extension,
     mut_truncation,
 ]
-
-# (Placeholders for when you write them)
 ipv6_specific_ops = [mut_ipv6_colon_mess, 
                      mut_ipv6_zero_compression, 
                      mut_ipv6_hextet_overflow] 
@@ -349,8 +347,6 @@ json_specific_ops = [mut_json_bracket_imbalance,
                      mut_json_type_confusion, 
                      mut_json_control_chars]
 
-# 3. Create the Target Profiles dictionary
-# The '+' operator combines the lists!
 TARGET_PROFILES = {
     "ipv4": common_ops + ipv4_specific_ops,
     "ipv6": common_ops + ipv6_specific_ops,

@@ -1,2 +1,7 @@
 numpy
 psutil
+pandas
+matplotlib
+coverage
+# jupyterlab
+# ipykernel	
