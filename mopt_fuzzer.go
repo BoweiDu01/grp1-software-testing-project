@@ -116,6 +116,7 @@ type FuzzResult struct {
 	Mutated []byte
 	ExecRes *ExecutionResult
 	Seed    *SeedEntry
+	GenerationTimeSec float64
 }
 
 type Logger struct {
@@ -137,7 +138,7 @@ func NewLogger(driverName string) *Logger {
 	header := []string{
 		"timestamp", "iteration", "is_interesting", "tier", "reason", "op_name",
 		"seed_text", "mutated_text", "seed_b64", "mutated_b64", "status",
-		"exit_code", "timed_out", "elapsed_sec", "command", "bug_type",
+		"exit_code", "timed_out", "elapsed_sec", "generation_time_sec", "command", "bug_type",
 		"exception", "message", "file", "line", "input_hash",
 	}
 	w.Write(header)
@@ -145,7 +146,7 @@ func NewLogger(driverName string) *Logger {
 	return &Logger{Writer: w, File: f}
 }
 
-func (l *Logger) Log(idx int, tier int, reason string, ops []string, seedData, mutated []byte, res *ExecutionResult, config DriverConfig) {
+func (l *Logger) Log(idx int, tier int, reason string, ops []string, seedData, mutated []byte, res *ExecutionResult, genTimeSec float64, config DriverConfig) {
 	if l == nil {
 		return
 	}
@@ -225,6 +226,7 @@ func (l *Logger) Log(idx int, tier int, reason string, ops []string, seedData, m
 		strconv.Itoa(res.ExitCode),
 		strconv.FormatBool(res.TimedOut),
 		fmt.Sprintf("%.3f", res.ExecTimeMs/1000.0),
+		fmt.Sprintf("%.6f", genTimeSec),
 		strings.Join(cmdParts, " "),
 		bugType,
 		exc,
@@ -1552,6 +1554,8 @@ func main() {
 		seedQueue = append(seedQueue, &SeedEntry{Data: []byte("127.0.0.1"), Energy: DefaultEnergy})
 	}
 
+	campaignStartTime := time.Now()
+	campaignStartISO := campaignStartTime.Format(time.RFC3339)
 	fmt.Printf("[*] Fuzzer started | Target: %s | Workers: %d | Seeds: %d\n", config.Target, *numWorkers, len(seedQueue))
 
 	tasks := make(chan FuzzTask, *numWorkers*2)
@@ -1578,9 +1582,12 @@ func main() {
 				}
 				queueMutex.Unlock()
 
+				genStart := time.Now()
 				ops, mutated := mm.SelectAndMutate(task.Seed.Data, seedsData, task.Seed.Energy, r)
+				genTimeSec := time.Since(genStart).Seconds()
+
 				res := executeTarget(ctx, config, mutated, workerDir, originalDir)
-				results <- FuzzResult{Ops: ops, Mutated: mutated, ExecRes: res, Seed: task.Seed}
+				results <- FuzzResult{Ops: ops, Mutated: mutated, ExecRes: res, Seed: task.Seed, GenerationTimeSec: genTimeSec}
 			}
 		}(w)
 	}
@@ -1611,7 +1618,7 @@ func main() {
 			}
 
 			currentCount := int(atomic.AddInt64(&count, 1))
-			logger.Log(currentCount, tier, sigType, res.Ops, res.Seed.Data, res.Mutated, res.ExecRes, config)
+			logger.Log(currentCount, tier, sigType, res.Ops, res.Seed.Data, res.Mutated, res.ExecRes, res.GenerationTimeSec, config)
 
 			if tier > 0 {
 				cat, exc, _ := classifyBug(res.ExecRes.Stdout, res.ExecRes.Stderr)
@@ -1650,8 +1657,10 @@ func main() {
 						for j := 0; j < 500; j++ {
 							if exploCtx.Err() != nil { break }
 							op := SurgicalOps[r.Intn(len(SurgicalOps))]
-
+							
+							genStart := time.Now()
 							mutated := op.Func(baseData, [][]byte{}, r)
+							genTimeSec := time.Since(genStart).Seconds()
 							execRes := executeTarget(exploCtx, config, mutated, exploitDir, originalDir)
 							lTier, _, lSig := eval.Evaluate(execRes, mutated)
 							
@@ -1667,7 +1676,7 @@ func main() {
 								lReward = 10.0
 							}
 							
-							logger.Log(c, lTier, "exploitation", []string{"exploitation", op.Name}, baseSeedData, mutated, execRes, config)
+							logger.Log(c, lTier, "exploitation", []string{"exploitation", op.Name}, baseSeedData, mutated, execRes, genTimeSec, config)
 							if lTier > 0 {
 								mm.RecordResult("blind:"+op.Name, lReward, lSig)
 								if lTier == 1 {
@@ -1744,6 +1753,68 @@ func main() {
 	cancel()
 
 	consolidateLogs()
+
+	campaignEndTime := time.Now()
+	campaignEndISO := campaignEndTime.Format(time.RFC3339)
+	campaignTotalSec := campaignEndTime.Sub(campaignStartTime).Seconds()
+
+	os.MkdirAll("logs", 0755)
+	summaryPath := filepath.Join("logs", "campaign_summary.csv")
+
+	fileExists := false
+	if _, err := os.Stat(summaryPath); err == nil {
+		fileExists = true
+	}
+
+	f, err := os.OpenFile(summaryPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err == nil {
+		defer f.Close()
+
+		writer := csv.NewWriter(f)
+
+		if !fileExists {
+			writer.Write([]string{
+				"target",
+				"start_time",
+				"end_time",
+				"duration_sec",
+				"iterations",
+				"throughput_exec_per_sec",
+				"worker_count",
+				"timeout_sec",
+				"max_iterations",
+				"seed",
+				"input_type",
+			})
+		}
+
+		completed := atomic.LoadInt64(&count)
+		throughput := 0.0
+		if campaignTotalSec > 0 {
+			throughput = float64(completed) / campaignTotalSec
+		}
+
+		writer.Write([]string{
+			config.Target,
+			campaignStartISO,
+			campaignEndISO,
+			fmt.Sprintf("%.6f", campaignTotalSec),
+			strconv.FormatInt(completed, 10),
+			fmt.Sprintf("%.6f", throughput),
+			strconv.Itoa(*numWorkers),
+			fmt.Sprintf("%.6f", config.Timeout),
+			strconv.Itoa(*maxIterations),
+			strconv.FormatInt(*seed, 10),
+			config.Type,
+		})
+
+		writer.Flush()
+		if err := writer.Error(); err != nil {
+			fmt.Printf("Error writing campaign summary: %v\n", err)
+		}
+	} else {
+		fmt.Printf("Error opening campaign summary file: %v\n", err)
+	}
 	fmt.Println("[*] Fuzzing complete")
 }
 
