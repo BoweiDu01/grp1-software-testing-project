@@ -12,3 +12,6 @@ __pycache__/
 /crashes_old/
 bug_counts.csv
 tracebacks.log
+/logs/**
+/fuzz_env/**
+/corpus

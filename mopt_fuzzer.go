@@ -1090,6 +1090,36 @@ func (ae *ASTMutationEngine) mutateValue(v interface{}, opFunc func([]byte, [][]
 // Evaluator & Executor
 // ---------------------------------------------------------------------------
 
+var tracebackFramePattern = regexp.MustCompile(`(?m)^\s*File "([^"]+)", line (\d+), in ([^\r\n]+)\s*$`)
+
+func extractTracebackFrames(stdout, stderr string) []string {
+	combined := stdout + "\n" + stderr
+	matches := tracebackFramePattern.FindAllStringSubmatch(combined, -1)
+	frames := make([]string, 0, len(matches))
+	for _, m := range matches {
+		if len(m) < 4 {
+			continue
+		}
+		file := strings.TrimSpace(m[1])
+		line := strings.TrimSpace(m[2])
+		fn := strings.TrimSpace(m[3])
+		frames = append(frames, fmt.Sprintf("%s:%s:%s", file, line, fn))
+	}
+	return frames
+}
+
+func computeBugSignature(stdout, stderr string) string {
+	cat, exc, _ := classifyBug(stdout, stderr)
+	parts := []string{cat, exc}
+	frames := extractTracebackFrames(stdout, stderr)
+	if len(frames) > 0 {
+		parts = append(parts, frames...)
+	}
+	payload := strings.Join(parts, "|")
+	h := sha256.Sum256([]byte(payload))
+	return hex.EncodeToString(h[:])
+}
+
 func classifyBug(stdout, stderr string) (string, string, int) {
 	combined := stdout + "\n" + stderr
 	// 1. match internal tuple format ('category', <class 'exc'>, ...)
@@ -1156,8 +1186,7 @@ func (e *Evaluator) Evaluate(res *ExecutionResult, data []byte) (int, string, st
 
 	// 1. Check for Crashes
 	if res.IsError {
-		cat, exc, _ := classifyBug(res.Stdout, res.Stderr)
-		sig := hex.EncodeToString(sha256.New().Sum([]byte(fmt.Sprintf("%s:%s", cat, exc))))
+		sig := computeBugSignature(res.Stdout, res.Stderr)
 		
 		e.CrashHitCounts[sig]++
 		count := e.CrashHitCounts[sig]
@@ -1618,19 +1647,19 @@ func main() {
 
 				if tier == 1 {
 					// Vulnerability Refinement Queueing: 
-					// Add hard crashes back to queue with High Energy, deduplicated by Exception Name.
+					// Add hard crashes back to queue with High Energy, deduplicated by bug signature.
 					if cat != "invalidity" && exc != "ParseException" {
 						queueMutex.Lock()
 						exists := false
 						for _, s := range seedQueue {
-							if s.Tier == 1 && s.Sig == exc {
+							if s.Tier == 1 && s.Sig == sig {
 								exists = true
 								break
 							}
 						}
 						if !exists {
 							seedQueue = append(seedQueue, &SeedEntry{
-								Data: res.Mutated, Energy: HighEnergy, Tier: 1, Sig: exc,
+								Data: res.Mutated, Energy: HighEnergy, Tier: 1, Sig: sig,
 							})
 						}
 						queueMutex.Unlock()

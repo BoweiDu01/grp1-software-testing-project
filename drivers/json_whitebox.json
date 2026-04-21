@@ -1,7 +1,7 @@
 {
   "name": "json_whitebox",
   "target": "../json-decoder/json_decoder_stv.py",
-  "interpreter": "./venv/bin/python", 
+  "interpreter": "./venv/Scripts/python.exe",
   "engine": "python",
   "input_mode": "argv",
   "argv": ["--str-json", "@@"],
