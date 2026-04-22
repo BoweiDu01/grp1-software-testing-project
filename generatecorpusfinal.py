@@ -167,11 +167,42 @@ def build_cidr_seeds(rng, settings):
         " 10.0.0.0/24 ", "10.0.0.0 / 24", "192.168.1.0/abc", "10.0.0.0/!@#"
     ]
 
+    # --- THE MISSING RANGES & WILDCARDS ---
+    ranges_and_wildcards = [
+        # 1. Single IPs (No CIDR, no range)
+        "192.0.2.18", 
+        "2001:db8::1",
+        
+        # 2. Explicit Ranges
+        "192.0.2.80-192.0.2.85",
+        "10.0.0.1-10.0.0.255",
+        
+        # 3. Shorthand Ranges
+        "192.0.2.170-175",
+        "192.168.1.1-30",
+        
+        # 4. Bracket Ranges & Lists
+        "192.0.2.8[0-5]",
+        "192.0.2.[5678]",
+        "10.0.[1-5].[10-20]",    # Multiple bracket groups
+        
+        # 5. Range/Bracket Anomalies (Crucial for Fuzzing!)
+        "192.0.2.85-192.0.2.80", # Reversed explicit range (End < Start)
+        "192.0.2.[5-1]",         # Reversed bracket range
+        "192.0.2.[]",            # Empty brackets
+        "192.0.2.[a-z]",         # Alphabetical in numeric brackets
+        "192.0.2.1-",            # Missing end of range
+        "-192.0.2.1",            # Missing start of range
+        "192.0.2.[1-5]/24",      # Mixing brackets and CIDR logic
+        "192.0.2.10-20/24"       # Mixing explicit range and CIDR logic
+    ]
+
     # UPDATED DICTIONARY KEYS
     return {
         "cidr/valid": ("cidr_valid", "txt", valid),
         "cidr/boundary": ("cidr_boundary", "txt", boundary),
         "cidr/anomalies": ("cidr_anomalies", "txt", anomalies),
+        "cidr/ranges": ("cidr_ranges", "txt", ranges_and_wildcards), # <-- Added this!
     }
 
 
