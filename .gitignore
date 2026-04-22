@@ -12,3 +12,4 @@ __pycache__/
 /crashes_old/
 bug_counts.csv
 tracebacks.log
+corpus/

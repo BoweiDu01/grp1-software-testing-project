@@ -1951,7 +1951,7 @@ def main():
     rebuild_bug_repro_ledger_from_crashes("crashes")
     loader = CorpusLoader(args.corpus_dir)
     # scheduler = GlobalMOPT_Scheduler(ALL_OPERATORS, update_interval=args.mopt_update_interval)
-    scheduler = TrueMOPT_Scheduler(ALL_OPERATORS, num_swarms=3, pilot_limit=200, core_limit=600)
+    scheduler = TrueMOPT_Scheduler(ALL_OPERATORS, num_swarms=3, pilot_limit=200, core_limit=400)
     tracker = CoverageTracker()
     dashboard = BlackboxCampaignDashboard(
         args.target,
