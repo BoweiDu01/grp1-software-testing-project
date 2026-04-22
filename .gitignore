@@ -15,3 +15,9 @@ tracebacks.log
 /logs/**
 /fuzz_env/**
 /corpus
+
+out_ipv4/
+out_ipv6
+json_baseline_out/
+logs/*
+corpus/

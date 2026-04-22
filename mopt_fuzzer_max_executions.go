@@ -1092,36 +1092,6 @@ func (ae *ASTMutationEngine) mutateValue(v interface{}, opFunc func([]byte, [][]
 // Evaluator & Executor
 // ---------------------------------------------------------------------------
 
-var tracebackFramePattern = regexp.MustCompile(`(?m)^\s*File "([^"]+)", line (\d+), in ([^\r\n]+)\s*$`)
-
-func extractTracebackFrames(stdout, stderr string) []string {
-	combined := stdout + "\n" + stderr
-	matches := tracebackFramePattern.FindAllStringSubmatch(combined, -1)
-	frames := make([]string, 0, len(matches))
-	for _, m := range matches {
-		if len(m) < 4 {
-			continue
-		}
-		file := strings.TrimSpace(m[1])
-		line := strings.TrimSpace(m[2])
-		fn := strings.TrimSpace(m[3])
-		frames = append(frames, fmt.Sprintf("%s:%s:%s", file, line, fn))
-	}
-	return frames
-}
-
-func computeBugSignature(stdout, stderr string) string {
-	cat, exc, _ := classifyBug(stdout, stderr)
-	parts := []string{cat, exc}
-	frames := extractTracebackFrames(stdout, stderr)
-	if len(frames) > 0 {
-		parts = append(parts, frames...)
-	}
-	payload := strings.Join(parts, "|")
-	h := sha256.Sum256([]byte(payload))
-	return hex.EncodeToString(h[:])
-}
-
 func classifyBug(stdout, stderr string) (string, string, int) {
 	combined := stdout + "\n" + stderr
 	// 1. match internal tuple format ('category', <class 'exc'>, ...)
@@ -1188,7 +1158,8 @@ func (e *Evaluator) Evaluate(res *ExecutionResult, data []byte) (int, string, st
 
 	// 1. Check for Crashes
 	if res.IsError {
-		sig := computeBugSignature(res.Stdout, res.Stderr)
+		cat, exc, _ := classifyBug(res.Stdout, res.Stderr)
+		sig := hex.EncodeToString(sha256.New().Sum([]byte(fmt.Sprintf("%s:%s", cat, exc))))
 		
 		e.CrashHitCounts[sig]++
 		count := e.CrashHitCounts[sig]
@@ -1482,13 +1453,13 @@ func consolidateLogs() {
 
 func main() {
 	driverPath := flag.String("driver", "", "Path to the JSON driver file")
-	maxIterations := flag.Int("max-iterations", 10000, "Maximum number of iterations")
+	maxExecutions := flag.Int("max-executions", 10000, "Maximum total executions (explore+exploit)")
 	seed := flag.Int64("seed", 42, "Random seed")
 	numWorkers := flag.Int("workers", runtime.NumCPU(), "Number of concurrent workers")
 	flag.Parse()
 
 	if *driverPath == "" {
-		fmt.Println("Usage: mopt_fuzzer --driver <path> [--max-iterations <n>] [--seed <n>] [--workers <n>]")
+		fmt.Println("Usage: mopt_fuzzer --driver <path> [--max-executions <n>] [--seed <n>] [--workers <n>]")
 		return
 	}
 
@@ -1593,7 +1564,8 @@ func main() {
 	exploitSemaphore := make(chan struct{}, 2)
 
 	var wg sync.WaitGroup
-
+	var totalExec int64 = 0
+	var mainIteration int64 = 0
 	originalDir, _ := os.Getwd()
 
 	for w := 0; w < *numWorkers; w++ {
@@ -1614,14 +1586,16 @@ func main() {
 				genStart := time.Now()
 				ops, mutated := mm.SelectAndMutate(task.Seed.Data, seedsData, task.Seed.Energy, r)
 				genTimeSec := time.Since(genStart).Seconds()
-
+				if atomic.LoadInt64(&totalExec) >= int64(*maxExecutions) {
+					continue
+				}
 				res := executeTarget(ctx, config, mutated, workerDir, originalDir)
+				atomic.AddInt64(&totalExec, 1)
 				results <- FuzzResult{Ops: ops, Mutated: mutated, ExecRes: res, Seed: task.Seed, GenerationTimeSec: genTimeSec}
 			}
 		}(w)
 	}
 
-	var count int64 = 0
 	resultsDone := make(chan bool)
 	go func() {
 		for res := range results {
@@ -1646,7 +1620,7 @@ func main() {
 				mm.RecordResult(op, reward, sig)
 			}
 
-			currentCount := int(atomic.AddInt64(&count, 1))
+			currentCount := int(atomic.AddInt64(&mainIteration, 1))
 			logger.Log(currentCount, tier, sigType, res.Ops, res.Seed.Data, res.Mutated, res.ExecRes, res.GenerationTimeSec, config)
 
 			if tier > 0 {
@@ -1654,19 +1628,19 @@ func main() {
 
 				if tier == 1 {
 					// Vulnerability Refinement Queueing: 
-					// Add hard crashes back to queue with High Energy, deduplicated by bug signature.
+					// Add hard crashes back to queue with High Energy, deduplicated by Exception Name.
 					if cat != "invalidity" && exc != "ParseException" {
 						queueMutex.Lock()
 						exists := false
 						for _, s := range seedQueue {
-							if s.Tier == 1 && s.Sig == sig {
+							if s.Tier == 1 && s.Sig == exc {
 								exists = true
 								break
 							}
 						}
 						if !exists {
 							seedQueue = append(seedQueue, &SeedEntry{
-								Data: res.Mutated, Energy: HighEnergy, Tier: 1, Sig: sig,
+								Data: res.Mutated, Energy: HighEnergy, Tier: 1, Sig: exc,
 							})
 						}
 						queueMutex.Unlock()
@@ -1685,12 +1659,14 @@ func main() {
 
 						for j := 0; j < 500; j++ {
 							if exploCtx.Err() != nil { break }
+							if atomic.LoadInt64(&totalExec) >= int64(*maxExecutions) { break } // break if past max exec
 							op := SurgicalOps[r.Intn(len(SurgicalOps))]
 							
 							genStart := time.Now()
 							mutated := op.Func(baseData, [][]byte{}, r)
 							genTimeSec := time.Since(genStart).Seconds()
 							execRes := executeTarget(exploCtx, config, mutated, exploitDir, originalDir)
+							atomic.AddInt64(&totalExec, 1)
 							lTier, _, lSig := eval.Evaluate(execRes, mutated)
 							
 							lReward := 0.0
@@ -1731,17 +1707,17 @@ func main() {
                 qLen := len(seedQueue)
                 queueMutex.Unlock()
                 
-                fmt.Printf("  [%d/%d] Queue: %d | %s\n", currentCount, *maxIterations, qLen, mm.GetStatsSummary())
+                fmt.Printf("  [%d/%d] Queue: %d | %s\n", currentCount, *maxExecutions, qLen, mm.GetStatsSummary())
 			}
 		}
 		resultsDone <- true
 	}()
 
-	var tasksSubmitted int64 = 0
-	for atomic.LoadInt64(&tasksSubmitted) < int64(*maxIterations) {
+	// var tasksSubmitted int64 = 0
+	for atomic.LoadInt64(&totalExec) < int64(*maxExecutions) {
 		if ctx.Err() != nil { break }
 
-		for len(tasks) < cap(tasks) && atomic.LoadInt64(&tasksSubmitted) < int64(*maxIterations) {
+		for len(tasks) < cap(tasks) && atomic.LoadInt64(&totalExec) < int64(*maxExecutions) {
 			queueMutex.Lock()
 			if len(seedQueue) == 0 {
 				queueMutex.Unlock()
@@ -1769,7 +1745,7 @@ func main() {
 			queueMutex.Unlock()
 
 			tasks <- FuzzTask{Seed: seed}
-			atomic.AddInt64(&tasksSubmitted, 1)
+			// atomic.AddInt64(&tasksSubmitted, 1)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -1817,7 +1793,7 @@ func main() {
 			})
 		}
 
-		completed := atomic.LoadInt64(&count)
+		completed := atomic.LoadInt64(&totalExec)
 		throughput := 0.0
 		if campaignTotalSec > 0 {
 			throughput = float64(completed) / campaignTotalSec
@@ -1832,7 +1808,7 @@ func main() {
 			fmt.Sprintf("%.6f", throughput),
 			strconv.Itoa(*numWorkers),
 			fmt.Sprintf("%.6f", config.Timeout),
-			strconv.Itoa(*maxIterations),
+			strconv.Itoa(*maxExecutions),
 			strconv.FormatInt(*seed, 10),
 			config.Type,
 		})
