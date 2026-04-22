@@ -1,7 +1,10 @@
-numpy
-psutil
-pandas
+coverage>=7.13.1
+numpy==2.4.1
+pandas==3.0.0
+python-dateutil==2.9.0.post0
+six==1.17.0
 matplotlib
 coverage
 # jupyterlab
 # ipykernel	
+

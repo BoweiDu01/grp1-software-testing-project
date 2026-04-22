@@ -7,5 +7,4 @@
 @REM If you pass a Python script directly as the binary_path, the operating system won't know how to run it 
 @REM without the python or uv run command preceding it.
 
-python run json_decoder_stv.py %~1 "%~2" --show-coverage
-exit /b %errorlevel%
+python run json_decoder_stv.py %* --show-coverage

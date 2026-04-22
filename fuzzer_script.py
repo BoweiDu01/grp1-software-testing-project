@@ -229,14 +229,20 @@ def mut_string_whitespace_noise(data):
     return _mut_to_bytes(mutated)
 
 def mut_ipv6_colon_mess(data):
+    """Targets a RANDOM colon for corruption, not just the first one."""
     try:
         text = data.decode('ascii')
-        if ':' not in text: return data
-        # Replace a single colon with an invalid cluster, or remove it entirely
-        mess = random.choice([":::", ": :", ";", ""])
-        # String replace with a limit of 1 to only affect one part of the IP
-        return text.replace(":", mess, 1).encode('ascii')
-    except: return data
+        colon_indices = [i for i, c in enumerate(text) if c == ':']
+        if not colon_indices: 
+            return data
+            
+        idx = random.choice(colon_indices)
+        mess = random.choice([":::", ": :", ";", "", "::.", "::/"])
+        
+        # Slice the string to replace only the targeted colon
+        return (text[:idx] + mess + text[idx+1:]).encode('ascii')
+    except: 
+        return data
 
 def mut_ipv6_zero_compression(data):
     try:
@@ -255,12 +261,14 @@ def mut_ipv6_hextet_overflow(data):
         text = data.decode('ascii')
         hextets = text.split(':')
         if not hextets: return data
+        
         idx = random.randint(0, len(hextets) - 1)
-        # Hex edge cases: 5 chars (invalid), negative, purely invalid chars, massive hex
-        edge_cases = ["10000", "-1", "FFFFF", "GGGG", "00000"]
+        # Added IPv4 transitions and edge cases
+        edge_cases = ["10000", "-1", "FFFFF", "GGGG", "00000", "192.168.1.1", "0xG"]
         hextets[idx] = random.choice(edge_cases)
+        
         return ":".join(hextets).encode('ascii')
-    except: return data    
+    except: return data
 
 def mut_json_bracket_imbalance(data):
     text = data.decode('utf-8', errors='ignore')
@@ -273,26 +281,36 @@ def mut_json_bracket_imbalance(data):
     return mutated.encode('utf-8')
 
 def mut_json_type_confusion(data):
+    """Recursively traverses a JSON AST to inject type confusion deep in the payload."""
     try:
-        # Only works if the current seed is still valid JSON
+        # Only works if the current seed is still structurally valid JSON
         obj = json.loads(data.decode('utf-8'))
         
-        # Helper to recursively find and mutate a random value
-        def mutate_dict(d):
-            if not isinstance(d, dict) or not d: return d
-            k = random.choice(list(d.keys()))
-            # Type confusion: swap strings for numbers, numbers for arrays, etc.
-            confusion_vals = [999999999999999999999, "NaN", None, True, "<script>", ["nested"]]
-            d[k] = random.choice(confusion_vals)
-            return d
+        def mutate_ast(node):
+            confusion_vals = [999999999999999999999, "NaN", "Infinity", "-Infinity", "\\uD83D", None, True]
             
-        if isinstance(obj, dict):
-            obj = mutate_dict(obj)
-            return json.dumps(obj).encode('utf-8')
-        return data
+            if isinstance(node, dict) and node:
+                k = random.choice(list(node.keys()))
+                # 50% chance to mutate this level, 50% chance to dive deeper (if possible)
+                if random.random() < 0.5 or not isinstance(node[k], (dict, list)):
+                    node[k] = random.choice(confusion_vals)
+                else:
+                    node[k] = mutate_ast(node[k])
+                    
+            elif isinstance(node, list) and node:
+                idx = random.randint(0, len(node) - 1)
+                if random.random() < 0.5 or not isinstance(node[idx], (dict, list)):
+                    node[idx] = random.choice(confusion_vals)
+                else:
+                    node[idx] = mutate_ast(node[idx])
+                    
+            return node
+            
+        mutated_obj = mutate_ast(obj)
+        return json.dumps(mutated_obj).encode('utf-8')
     except:
-        # Fallback if seed is already corrupted
-        return mut_string_delimiter_cluster(data)
+        # Fallback if seed is already structurally corrupted by previous mutations
+        return data
 
 def mut_json_control_chars(data):
     text = data.decode('utf-8', errors='ignore')
@@ -305,7 +323,164 @@ def mut_json_control_chars(data):
     bad_chars = "\x00\n\t\x1b\x08"
     mutated = text[:idx+1] + random.choice(bad_chars) + text[idx+1:]
     return mutated.encode('utf-8')
+def mut_cidr_slash_corruption(data):
+    """Corrupts, duplicates, or removes the '/' delimiter."""
+    try:
+        text = data.decode('ascii')
+        if '/' not in text: 
+            return data
+        
+        corruptions = [
+            text.replace("/", "//", 1),   # Double slash
+            text.replace("/", "\\", 1),   # Wrong slash direction
+            text.replace("/", " / ", 1),  # Whitespace injection
+            text.replace("/", "", 1),     # Missing delimiter entirely
+            text.replace("/", "/-", 1)    # Premature negative sign
+        ]
+        return random.choice(corruptions).encode('ascii')
+    except: 
+        return data
 
+def mut_cidr_prefix_overflow(data):
+    """Injects boundary-breaking prefix lengths for both IPv4 and IPv6."""
+    try:
+        text = data.decode('ascii')
+        if '/' not in text: 
+            return data
+            
+        ip, _ = text.split('/', 1)
+        # 33 (v4 boundary), 129 (v6 boundary), 255/256 (byte bounds), negatives, and massive ints
+        edge_cases = ["33", "129", "255", "256", "-1", "-24", "999999", "4294967295", "0"]
+        return f"{ip}/{random.choice(edge_cases)}".encode('ascii')
+    except: 
+        return data
+
+def mut_cidr_type_confusion(data):
+    """Attempts to break the integer cast of the prefix length."""
+    try:
+        text = data.decode('ascii')
+        if '/' not in text: 
+            return data
+            
+        ip, _ = text.split('/', 1)
+        # Hex, floats, raw strings, octal-padding, and nulls
+        confusion = ["0x18", "24.5", "abc", "024", "NaN", "None", "\x00"]
+        return f"{ip}/{random.choice(confusion)}".encode('ascii')
+    except: 
+        return data
+
+def mut_cidr_truncation(data):
+    """Strips either the IP address or the prefix length entirely."""
+    try:
+        text = data.decode('ascii')
+        if '/' not in text: 
+            return data
+            
+        ip, prefix = text.split('/', 1)
+        truncations = [
+            f"{ip}/",    # Valid IP, trailing slash, missing prefix
+            f"/{prefix}" # Missing IP, leading slash, valid prefix
+        ]
+        return random.choice(truncations).encode('ascii')
+    except: 
+        return data
+
+def mut_range_reversal(data):
+    """Swaps the start and end of a hyphenated range to trigger logic/math bugs."""
+    try:
+        text = data.decode('ascii')
+        if '-' not in text: 
+            return data
+            
+        parts = text.split('-', 1)
+        # Swap the sides: 192.0.2.170-175 becomes 175-192.0.2.170
+        reversed_range = f"{parts[1]}-{parts[0]}"
+        
+        # Or inject a negative shorthand: 192.0.2.170--175
+        double_dash = text.replace("-", "--", 1)
+        
+        return random.choice([reversed_range, double_dash]).encode('ascii')
+    except: 
+        return data
+    
+def mut_bracket_corruption(data):
+    """Unbalances, empties, or nests bracket notation."""
+    try:
+        text = data.decode('ascii')
+        if '[' not in text and ']' not in text:
+            # If no brackets exist, aggressively inject them into a standard IP
+            idx = random.randint(0, len(text))
+            return (text[:idx] + random.choice(["[", "]"]) + text[idx:]).encode('ascii')
+            
+        corruptions = [
+            text.replace("[", "", 1),       # Delete opening bracket
+            text.replace("]", "", 1),       # Delete closing bracket
+            text.replace("[", "[[", 1),     # Nesting: 192.0.2.[[5-8]
+            text.replace("]", "]]", 1),     # 192.0.2.[5-8]]
+            re.sub(r'\[.*?\]', '[]', text)  # Empty brackets: 192.0.2.[]
+        ]
+        return random.choice(corruptions).encode('ascii')
+    except: 
+        return data
+    
+def mut_delimiter_confusion(data):
+    """Swaps valid delimiters for invalid ones based on the new grammar."""
+    try:
+        text = data.decode('ascii')
+        delimiters = ['.', '/', '-', '[', ']']
+        
+        # Find all delimiters currently in the seed
+        existing = [c for c in text if c in delimiters]
+        if not existing: 
+            return data
+            
+        target_char = random.choice(existing)
+        replacement = random.choice([d for d in delimiters if d != target_char])
+        
+        # Example: 192.0.2.170-175 -> 192.0.2.170[175
+        # Example: 192.0.2.[5678] -> 192-0-2-[5678]
+        return text.replace(target_char, replacement, 1).encode('ascii')
+    except: 
+        return data
+
+def mut_universal_semantic_boundaries(data):
+    """Pushes any isolated integer in the string to critical RFC boundaries, preserving grammar."""
+    try:
+        text = data.decode('ascii')
+        # Find all isolated numbers (e.g., the 24 in /24, the 175 in -175, or the octets)
+        matches = list(re.finditer(r'\d+', text))
+        if not matches: 
+            return data
+        
+        match = random.choice(matches)
+        # RFC Boundaries: 0, 127 (Loopback), 169 (APIPA), 224 (Multicast), 240 (Experimental), 255, 256 (Overflow)
+        boundaries = ["0", "127", "169", "224", "240", "255", "256", "-1", "4294967296"]
+        replacement = random.choice(boundaries)
+        
+        # Splice the boundary into the exact position of the original number
+        mutated = text[:match.start()] + replacement + text[match.end():]
+        return mutated.encode('ascii')
+    except: 
+        return data
+
+def mut_universal_zero_padding(data):
+    """Injects leading zeros to any integer to test for Octal conversion vulnerabilities."""
+    try:
+        text = data.decode('ascii')
+        matches = list(re.finditer(r'\d+', text))
+        if not matches: 
+            return data
+        
+        match = random.choice(matches)
+        original_num = match.group(0)
+        
+        # Add 1 to 3 leading zeros (e.g., 175 becomes 00175)
+        padded_num = original_num.zfill(len(original_num) + random.randint(1, 3))
+        
+        mutated = text[:match.start()] + padded_num + text[match.end():]
+        return mutated.encode('ascii')
+    except: 
+        return data
 # operators = [
 #     mut_bitflip,
 #     mut_arithmetic,
@@ -331,6 +506,8 @@ common_ops = [
     mut_string_delimiter_cluster,
     mut_string_numeric_jitter,
     mut_string_whitespace_noise,
+    mut_universal_semantic_boundaries,
+    mut_universal_zero_padding,
 ]
 
 ipv4_specific_ops = [
@@ -340,163 +517,178 @@ ipv4_specific_ops = [
     mut_length_extension,
     mut_truncation,
 ]
-ipv6_specific_ops = [mut_ipv6_colon_mess, 
+ipv6_specific_ops = [
+    mut_ipv6_colon_mess, 
                      mut_ipv6_zero_compression, 
                      mut_ipv6_hextet_overflow] 
+
 json_specific_ops = [mut_json_bracket_imbalance, 
                      mut_json_type_confusion, 
                      mut_json_control_chars]
 
-TARGET_PROFILES = {
-    "ipv4": common_ops + ipv4_specific_ops,
-    "ipv6": common_ops + ipv6_specific_ops,
-    "json": common_ops + json_specific_ops,
-    "cidr": common_ops, # Defaults to common if no specific ops exist yet
-}
+cidr_specific_ops = [
+    mut_cidr_slash_corruption,
+    mut_cidr_prefix_overflow,
+    mut_cidr_type_confusion,
+    mut_cidr_truncation,
+]
 
-class PSO_MOpt:
-    def __init__(self, num_particles, dim):
-        self.num_particles = num_particles
-        self.dim = dim
+grammar_specific_ops = [
+    mut_range_reversal,
+    mut_bracket_corruption,
+    mut_delimiter_confusion
+]
 
-        # logits (better than raw probs)
-        self.positions = np.random.randn(num_particles, dim)
-        self.velocities = np.zeros((num_particles, dim))
+ALL_OPERATORS = list(dict.fromkeys(
+    common_ops + ipv4_specific_ops + ipv6_specific_ops + json_specific_ops + cidr_specific_ops + grammar_specific_ops
+))
 
-        self.pbest_positions = self.positions.copy()
-        self.pbest_scores = np.zeros(num_particles)
-
-        self.gbest_position = self.positions[0].copy()
-        self.gbest_score = -1
-
-        # PSO params
-        self.w = 0.7
-        self.c1 = 1.5
-        self.c2 = 1.5
-
-        # reward tracking (important)
-        self.current_rewards = np.zeros(num_particles)
-        self.current_counts = np.zeros(num_particles)
-
-        self.active_particle = 0
-
-    def softmax(self, x):
-        e = np.exp(x - np.max(x))
-        return e / e.sum()
-
-    def get_current_distribution(self):
-        return self.softmax(self.positions[self.active_particle])
-
-    def record_reward(self, reward):
-        i = self.active_particle
-        self.current_rewards[i] += reward
-        self.current_counts[i] += 1
-
-    def step_particle(self):
-        i = self.active_particle
-
-        if self.current_counts[i] > 0:
-            score = self.current_rewards[i] / self.current_counts[i]
-
-            # update pbest
-            if score > self.pbest_scores[i]:
-                self.pbest_scores[i] = score
-                self.pbest_positions[i] = self.positions[i].copy()
-
-            # update gbest
-            if score > self.gbest_score:
-                self.gbest_score = score
-                self.gbest_position = self.positions[i].copy()
-
-        # reset stats
-        self.current_rewards[i] = 0
-        self.current_counts[i] = 0
-
-        # move to next particle
-        self.active_particle = (self.active_particle + 1) % self.num_particles
-
-    def update_swarm(self):
-        for i in range(self.num_particles):
-            r1, r2 = np.random.rand(), np.random.rand()
-
-            self.velocities[i] = (
-                self.w * self.velocities[i]
-                + self.c1 * r1 * (self.pbest_positions[i] - self.positions[i])
-                + self.c2 * r2 * (self.gbest_position - self.positions[i])
-            )
-
-            self.positions[i] += self.velocities[i]
-
-
-class MultiSwarm_MOPT_Scheduler:
-    def __init__(self, target_profiles, update_interval=10):
-        """
-        target_profiles: A dictionary mapping format names to their specific operators.
-        Example: 
-        {
-            "ipv4": [mut_bitflip, mut_octet_overflow, ...],
-            "json": [mut_json_shuffle, mut_key_duplicate, ...],
-        }
-        """
-        self.update_interval = update_interval
-        self.swarms = {}
+class MOPT_Swarm:
+    """Represents a single probability distribution exploring the operator space."""
+    def __init__(self, num_ops, xmin=0.01, xmax=0.99):
+        self.num_ops = num_ops
+        self.xmin = xmin
+        self.xmax = xmax
         
-        # Initialize a separate PSO instance for each data format
-        for profile_name, operators in target_profiles.items():
-            num_ops = len(operators)
-            self.swarms[profile_name] = {
-                "pso": PSO_MOpt(num_particles=8, dim=num_ops),
-                "operators": operators,
-                "probabilities": np.ones(num_ops, dtype=float) / max(1, num_ops),
-                "counter": 0
-            }
+        # Each operator is a particle. Position represents its probability weight.
+        self.positions = np.random.uniform(xmin, xmax, num_ops)
+        self.velocities = np.zeros(num_ops)
+        
+        # Local bests (pbest) for this specific swarm
+        self.pbest_positions = self.positions.copy()
+        self.pbest_scores = np.zeros(num_ops)
+        
+        # Performance tracking for the current epoch (Pilot or Core)
+        self.current_rewards = np.zeros(num_ops)
+        self.current_counts = np.zeros(num_ops)
 
-    def _classify_seed(self, seed_data):
-        """Quickly identify the format of the seed to route it to the right swarm."""
-        text = seed_data.decode('utf-8', errors='ignore').strip()
-        if text.startswith('{') or text.startswith('['):
-            return "json"
-        if '/' in text:
-            return "cidr"
-        if ':' in text and not text.startswith('{'):
-            return "ipv6"
-        return "ipv4"
+    def get_distribution(self):
+        # Normalize positions to create a valid probability distribution (sums to 1.0)
+        return self.positions / np.sum(self.positions)
+
+
+class TrueMOPT_Scheduler:
+    """Implements Concurrent Pilot -> Core -> Update lifecycle from the MOPT paper."""
+    def __init__(self, operators, num_swarms=3, pilot_limit=100, core_limit=500):
+        self.operators = operators
+        self.num_ops = len(operators)
+        self.num_swarms = num_swarms
+        
+        # How many executions each phase gets
+        self.pilot_limit = pilot_limit  # Executions PER SWARM during pilot
+        self.core_limit = core_limit    # Total executions for the winning swarm during core
+        
+        # PSO Initialization Module
+        self.swarms = [MOPT_Swarm(self.num_ops) for _ in range(num_swarms)]
+        
+        # Global bests (gbest) tracked across ALL swarms and ALL time
+        self.gbest_position = self.swarms[0].positions[0] 
+        self.gbest_score = -1.0
+        
+        # State Machine Tracking
+        self.state = "pilot" 
+        self.active_swarm_idx = 0 
+        self.executions_in_current_phase = 0
+        
+        # PSO Constants
+        self.w = 0.7 
+        self.c1 = 1.5 
+        self.c2 = 1.5 
 
     def select_operator(self, seed_data):
-        # 1. Identify which swarm owns this seed
-        profile_name = self._classify_seed(seed_data)
+        if self.state == "pilot":
+            # SIMULTANEOUS EVALUATION: Pick a swarm completely at random for this specific mutation
+            swarm_idx = np.random.randint(self.num_swarms)
+        else:
+            # CORE EXPLOITATION: Lock into the best swarm found during the pilot phase
+            swarm_idx = self.active_swarm_idx
+
+        active_swarm = self.swarms[swarm_idx]
+        probs = active_swarm.get_distribution()
         
-        # Fallback if profile doesn't exist
-        if profile_name not in self.swarms:
-            profile_name = list(self.swarms.keys())[0] 
+        op_idx = np.random.choice(self.num_ops, p=probs)
+        
+        # Tag the operator with the swarm that selected it so rewards map back correctly
+        return self.operators[op_idx], op_idx, f"swarm_{swarm_idx}"
+
+    def update_probabilities(self, op_idx, profile_name, reward):
+        # profile_name will be "swarm_0", "swarm_1", etc.
+        # Parse it to ensure the asynchronous reward goes to the exact swarm that earned it
+        swarm_idx = int(profile_name.split("_")[1])
+        swarm = self.swarms[swarm_idx]
+        
+        swarm.current_rewards[op_idx] += reward
+        swarm.current_counts[op_idx] += 1
+        
+        self.executions_in_current_phase += 1
+        self._check_state_transitions()
+
+    def _check_state_transitions(self):
+        """Drives the Pilot -> Core -> Update loop."""
+        if self.state == "pilot":
+            # Pilot ends when ALL swarms have roughly hit their limits (total executions)
+            total_pilot_target = self.pilot_limit * self.num_swarms
+            if self.executions_in_current_phase >= total_pilot_target:
+                self._transition_to_core()
+                    
+        elif self.state == "core":
+            # Core ends when the winning swarm hits its core limit
+            if self.executions_in_current_phase >= self.core_limit:
+                self._transition_to_update()
+
+    def _transition_to_core(self):
+        """Core Fuzzing Module: Pick the most efficient swarm from the pilot phase."""
+        self.state = "core"
+        self.executions_in_current_phase = 0
+        
+        best_swarm_score = -1
+        best_idx = 0
+        
+        for i, swarm in enumerate(self.swarms):
+            total_reward = np.sum(swarm.current_rewards)
+            total_count = np.sum(swarm.current_counts)
+            score = total_reward / total_count if total_count > 0 else 0
             
-        swarm_data = self.swarms[profile_name]
-        pso = swarm_data["pso"]
-        operators = swarm_data["operators"]
+            if score > best_swarm_score:
+                best_swarm_score = score
+                best_idx = i
+                
+        self.active_swarm_idx = best_idx
 
-        # 2. Get the current distribution from this specific swarm
-        swarm_data["probabilities"] = pso.get_current_distribution()
+    def _transition_to_update(self):
+        """PSO Updating Module: Calculate efficiencies and move particles."""
+        for swarm in self.swarms:
+            for i in range(self.num_ops):
+                if swarm.current_counts[i] > 0:
+                    score = swarm.current_rewards[i] / swarm.current_counts[i]
+                    
+                    if score > swarm.pbest_scores[i]:
+                        swarm.pbest_scores[i] = score
+                        swarm.pbest_positions[i] = swarm.positions[i]
+                    
+                    if score > self.gbest_score:
+                        self.gbest_score = score
+                        self.gbest_position = swarm.positions[i]
         
-        # 3. Select the operator
-        op_idx = np.random.choice(len(operators), p=swarm_data["probabilities"])
-        return operators[op_idx], op_idx, profile_name
+        for swarm in self.swarms:
+            for i in range(self.num_ops):
+                r1, r2 = np.random.rand(), np.random.rand()
+                
+                swarm.velocities[i] = (
+                    self.w * swarm.velocities[i]
+                    + self.c1 * r1 * (swarm.pbest_positions[i] - swarm.positions[i])
+                    + self.c2 * r2 * (self.gbest_position - swarm.positions[i])
+                )
+                
+                new_pos = swarm.positions[i] + swarm.velocities[i]
+                swarm.positions[i] = np.clip(new_pos, swarm.xmin, swarm.xmax)
+                
+            swarm.current_rewards.fill(0)
+            swarm.current_counts.fill(0)
 
-    def update_probabilities(self, profile_name, reward):
-        # Only update the swarm that was actually used
-        if profile_name not in self.swarms:
-            return
-            
-        swarm_data = self.swarms[profile_name]
-        pso = swarm_data["pso"]
-        
-        pso.record_reward(reward)
-        swarm_data["counter"] += 1
-
-        if swarm_data["counter"] % self.update_interval == 0:
-            pso.step_particle()
-            if pso.active_particle == 0:
-                pso.update_swarm()
-
+        # Loop back to Pilot Fuzzing Module
+        self.state = "pilot"
+        self.executions_in_current_phase = 0
 
 class PerformanceStats:
     def __init__(self):
@@ -604,6 +796,13 @@ class CoverageTracker:
         etype = exception_type or "UnknownException"
         msg = (message or "").strip()
         hinted = (hinted_bug_type or "").lower()
+
+        # --- NEW: STOP ERROR MESSAGE EXPLOSION ---
+        # Collapse dynamic parser characters and positions into a single signature
+        msg = re.sub(r"found '.*?'", "found '<invalid_token>'", msg)
+        msg = re.sub(r"\(at char \d+\)", "(at char X)", msg)
+        msg = re.sub(r"col:\d+", "col:X", msg)
+        msg = re.sub(r"line:\d+", "line:X", msg)
 
         # Collapse pyparsing location/token specifics into one semantic parser-failure bucket.
         if "parseexception" in etype.lower():
@@ -864,7 +1063,12 @@ def _worker_exec_loop(binary_path, input_arg, timeout_sec, work_dir, in_q, out_q
             break
 
         job_id, input_text = job
-        cmd = [binary_path, input_arg, input_text]
+        # cmd = [binary_path, input_arg, input_text]
+        # If the target is a Python script, automatically prepend "python" to the command
+        if binary_path.endswith('.py'):
+            cmd = [sys.executable, binary_path, input_arg, input_text]
+        else:
+            cmd = [binary_path, input_arg, input_text]
         cmd_display = " ".join(cmd)
         start = time.time()
 
@@ -877,13 +1081,22 @@ def _worker_exec_loop(binary_path, input_arg, timeout_sec, work_dir, in_q, out_q
                 cwd=work_dir,
             )
             elapsed = time.time() - start
+            # --- NEW: SILENT CRASH DETECTION ---
+            combined_out = (completed.stdout + completed.stderr).upper()
+            simulated_status = "success"
+            simulated_exit_code = completed.returncode
+            
+            if "TRACEBACK" in combined_out or "EXCEPTION:" in combined_out:
+                simulated_status = "crash"
+                simulated_exit_code = 1
+            # -----------------------------------
             out_q.put(
                 {
                     "job_id": job_id,
-                    "status": "success",
+                    "status": simulated_status,
                     "stdout": completed.stdout,
                     "stderr": completed.stderr,
-                    "exit_code": completed.returncode,
+                    "exit_code": simulated_exit_code,
                     "elapsed_sec": elapsed,
                     "rss_delta_kb": 0,
                     "timed_out": False,
@@ -947,7 +1160,12 @@ class CLITargetExecutor:
         if not input_text:
             input_text = "0"
 
-        cmd = [self.binary_path, self.input_arg, input_text]
+        # cmd = [self.binary_path, self.input_arg, input_text]
+        # If the target is a Python script, automatically prepend "python" to the command
+        if self.binary_path.endswith('.py'):
+            cmd = [sys.executable, self.binary_path, self.input_arg, input_text]
+        else:
+            cmd = [self.binary_path, self.input_arg, input_text]
         cmd_display = " ".join(cmd)
         start = time.time()
 
@@ -965,11 +1183,21 @@ class CLITargetExecutor:
             elapsed = time.time() - start
             mem_after = int(proc.memory_info().rss / 1024)
             rss_delta = max(0, mem_after - mem_before)
+            # --- NEW: SILENT CRASH DETECTION ---
+            combined_out = (completed.stdout + completed.stderr).upper()
+            simulated_status = "success"
+            simulated_exit_code = completed.returncode
+            
+            # Specifically check for the exact error printouts, avoiding the success message
+            if "BUG HAS BEEN TRIGGERED" in combined_out or "UNKNOWN EXCEPTION HAS BEEN TRIGGERED" in combined_out:
+                simulated_status = "crash"
+                simulated_exit_code = 1
+            # -----------------------------------
             return ExecutionResult(
-                status="success",
+                status=simulated_status,
                 stdout=completed.stdout,
                 stderr=completed.stderr,
-                exit_code=completed.returncode,
+                exit_code=simulated_exit_code,
                 elapsed_sec=elapsed,
                 rss_delta_kb=rss_delta,
                 timed_out=False,
@@ -1364,8 +1592,11 @@ def _append_bug_repro_ledger(data_hash, input_bytes, bug_signature, reason, json
                 "input_b64",
                 "crash_json",
                 "crash_bin",
+                "is_semantic_ipv4",
             ])
-
+        # Check if the mutated input strictly kept the A.B.C.D number structure
+        input_text_log = _decode_input_for_log(input_bytes)
+        is_semantic = "Yes" if re.search(r"^\d{1,4}(\.\d{1,4}){3}$", input_text_log) else "No"
         writer.writerow([
             timestamp,
             os.path.basename(json_ref).replace(".json", ""),
@@ -1385,6 +1616,7 @@ def _append_bug_repro_ledger(data_hash, input_bytes, bug_signature, reason, json
             input_b64,
             json_ref,
             _normalize_path_for_log(bin_path),
+            is_semantic,
         ])
 
 
@@ -1512,10 +1744,7 @@ class BlackboxCampaignDashboard:
         self.tier_hits = {"tier_1": 0, "tier_2": 0, "tier_3": 0}
         self.category_hits = {}
         self.profile_stats = {
-            "ipv4": {"executions": 0, "rewards": 0, "max_depth": 0},
-            "ipv6": {"executions": 0, "rewards": 0, "max_depth": 0},
-            "json": {"executions": 0, "rewards": 0, "max_depth": 0},
-            "cidr": {"executions": 0, "rewards": 0, "max_depth": 0},
+            "global": {"executions": 0, "rewards": 0, "max_depth": 0},
         }
 
     def show(self, tracker, scheduler):
@@ -1548,22 +1777,50 @@ class BlackboxCampaignDashboard:
         print(
             f" Tier1: {self.tier_hits['tier_1']:<4} Tier2: {self.tier_hits['tier_2']:<4} Tier3: {self.tier_hits['tier_3']:<4}"
         )
-        print(f" MOPT UpdateEvery: {scheduler.update_interval:<4} selections")
-        print(" [TARGET FORMAT PROFILER]")
-        print(f" {'Format':<8} | {'Executions':<10} | {'Rewards':<8} | {'Max Depth':<10} | {'Hit Rate'}")
-        for fmt, stats in self.profile_stats.items():
-            execs = stats['executions']
-            rwds = stats['rewards']
-            depth = stats['max_depth']
-            rate = (rwds / execs * 100) if execs > 0 else 0.0
-            print(f" {fmt.upper():<8} | {execs:<10} | {rwds:<8} | {depth:<10} | {rate:.2f}%")
+        # --- NEW TRUE MOPT DASHBOARD DISPLAY ---
+        print(
+            f" MOPT State: {scheduler.state.upper():<8} | Active Swarm: {scheduler.active_swarm_idx:<2} | Phase Execs: {scheduler.executions_in_current_phase}"
+        )
+        print(f" Limits -> Pilot: {scheduler.pilot_limit} | Core: {scheduler.core_limit}")
+        # --- NEW SWARM LEADERBOARD ---
         print("=" * 50)
-        for profile_name, swarm_data in scheduler.swarms.items():
-            print(f" [Swarm Profile: {profile_name.upper()}]")
-            for i, op in enumerate(swarm_data["operators"]):
-                print(f"   {op.__name__:<28}: {swarm_data['probabilities'][i]:.6f}")
-            print("- " * 25)
+        print(f" [MOPT SWARM TRACKER - {scheduler.state.upper()} PHASE]")
+        
+        for i, swarm in enumerate(scheduler.swarms):
+            # Calculate live efficiency (Rewards / Executions)
+            total_reward = np.sum(swarm.current_rewards)
+            total_count = np.sum(swarm.current_counts)
+            efficiency = total_reward / total_count if total_count > 0 else 0.0
+
+            # Find the top 3 operators by current probability weight
+            probs = swarm.get_distribution()
+            top_indices = np.argsort(probs)[-3:][::-1]
+            top_ops = [f"{scheduler.operators[idx].__name__} ({probs[idx]:.3f})" for idx in top_indices]
+            
+            # Put a visual marker next to the winning swarm during CORE phase
+            marker = ">>" if scheduler.state == "core" and i == scheduler.active_swarm_idx else "  "
+            
+            print(f"{marker} Swarm {i} | Eff: {efficiency:.2f} | Execs: {int(total_count)}")
+            print(f"    Top: {', '.join(top_ops)}")
+            
         print("=" * 50)
+        # print(" [TARGET FORMAT PROFILER]")
+        # print(f" {'Format':<8} | {'Executions':<10} | {'Rewards':<8} | {'Max Depth':<10} | {'Hit Rate'}")
+        # for fmt, stats in self.profile_stats.items():
+        #     execs = stats['executions']
+        #     rwds = stats['rewards']
+        #     depth = stats['max_depth']
+        #     rate = (rwds / execs * 100) if execs > 0 else 0.0
+        #     print(f" {fmt.upper():<8} | {execs:<10} | {rwds:<8} | {depth:<10} | {rate:.2f}%")
+        # print("=" * 50)
+        
+        # # Print the probability distribution of the CURRENTLY active swarm
+        # print(f" [Active Swarm ({scheduler.active_swarm_idx}) Operator Distributions]")
+        # active_swarm = scheduler.swarms[scheduler.active_swarm_idx]
+        # probs = active_swarm.get_distribution()
+        # for i, op in enumerate(scheduler.operators):
+        #     print(f"   {op.__name__:<28}: {probs[i]:.6f}")
+        # print("=" * 50)
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(
@@ -1693,8 +1950,8 @@ def main():
         clear_binary_owned_logs("logs")
     rebuild_bug_repro_ledger_from_crashes("crashes")
     loader = CorpusLoader(args.corpus_dir)
-    scheduler = MultiSwarm_MOPT_Scheduler(
-        TARGET_PROFILES, update_interval=args.mopt_update_interval)
+    # scheduler = GlobalMOPT_Scheduler(ALL_OPERATORS, update_interval=args.mopt_update_interval)
+    scheduler = TrueMOPT_Scheduler(ALL_OPERATORS, num_swarms=3, pilot_limit=200, core_limit=600)
     tracker = CoverageTracker()
     dashboard = BlackboxCampaignDashboard(
         args.target,
@@ -1762,8 +2019,7 @@ def main():
             is_interesting, tier, reason = check_interesting(
                 result, mem_spike, tracker, feedback, stats)
             
-            # [NEW] Classify the seed manually so we have a profile_name for the tracker!
-            profile_name = scheduler._classify_seed(seed_input)
+            profile_name = "global"
 
             # --- NEW STATS TRACKING CODE GOES HERE ---
             if hasattr(dashboard, 'profile_stats') and profile_name in dashboard.profile_stats:
@@ -1991,9 +2247,9 @@ def main():
                     loader.add_seed(mutated_input, args.max_corpus_size)
 
                 reward = mutation_reward(tier, reason)
-                scheduler.update_probabilities(profile_name, reward)
+                scheduler.update_probabilities(op_idx, profile_name, reward)
             else:
-                scheduler.update_probabilities(profile_name, 0.0)
+                scheduler.update_probabilities(op_idx, profile_name, 0.0)
 
             completed += 1
             dashboard.iterations = completed
