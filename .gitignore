@@ -12,6 +12,9 @@ __pycache__/
 /crashes_old/
 bug_counts.csv
 tracebacks.log
+/logs/**
+/fuzz_env/**
+/corpus
 
 out_ipv4/
 out_ipv6

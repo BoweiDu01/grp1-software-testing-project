@@ -1,6 +1,6 @@
 {
   "name": "cidrize",
-  "target": "./mac-cidrize-runner",
+  "target": "./win-cidrize-runner",
   "input_mode": "argv",
   "argv": ["--func", "cidrize", "--ipstr", "@@", "--raise-errors"],
   "type": "cidrize",
