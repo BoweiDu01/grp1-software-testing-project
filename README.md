@@ -69,3 +69,29 @@ python fuzzer_script.py --no-auto-tune --timeout 0.4 --worker-count 2 --inflight
 # To run any target application (for verification of inputs)
 
 .\win-ipv4-parser.exe --ipstr "insert string here"
+
+
+# To run baseline
+
+you will need these packages  
+sudo apt install python3-dev build-essential  
+sudo apt install --no-install-recommends afl++ (For light installation 500mb~)
+
+check core pattern by using `cat /proc/sys/kernel/core_pattern`
+
+if you get something like `|/wsl-capture-crash %t %E %p %s`, AFL++ may not run properly. Quick fix is AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 but we dont want that.
+
+`echo core | sudo tee /proc/sys/kernel/core_pattern`
+
+Restore  
+echo '|/wsl-capture-crash %t %E %p %s' | sudo tee /proc/sys/kernel/core_pattern
+
+# For binary QEMU
+git clone https://github.com/AFLplusplus/AFLplusplus  
+cd AFLplusplus  
+install any packages if needed  
+make distrib
+
+make sure `[+] libqasan ready [+] All done for qemu_mode, enjoy!`
+
+Chances are you were missing some dependencies before the above happens
