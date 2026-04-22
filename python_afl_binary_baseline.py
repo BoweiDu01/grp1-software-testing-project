@@ -1,7 +1,5 @@
 # aflpp_binary_baseline.py
 #
-# Run with AFL++ wrapper style:
-#
 # afl-fuzz -Q -i corpus/networking/cidr_mixed -o out -E 5000 -- \
 #   ./.venv/bin/python3 aflpp_binary_baseline.py --driver drivers/cidrize.json
 #
@@ -14,17 +12,38 @@
 # - If the target binary is AFL++-instrumented, drop -Q and run normally.
 # - This wrapper preserves your existing CSV schema and bug_counts-based handled bug detection.
 
-# afl-fuzz -Q -i corpus/networking/cidr_mixed -o out -E 5000 -- \
-#   ./.venv/bin/python3 aflpp_binary_baseline.py --driver drivers/cidrize.json
+# ~/software_testing/AFLplusplus/afl-fuzz -Q \
+#   -z \
+#   -t 3000 \
+#   -i corpus/networking/cidr_mixed \
+#   -o out_cidr \
+#   -E 5000 \
+#   -- \
+#   ./.venv/bin/python3 python_afl_binary_baseline.py --driver drivers/cidrize.json
 
-# Without QEMU for already instrumented binaries
-# afl-fuzz -i corpus/networking/cidr_mixed -o out -E 5000 -- \
-#   ./.venv/bin/python3 aflpp_binary_baseline.py --driver drivers/cidrize.json
+# ~/software_testing/AFLplusplus/afl-fuzz -Q \
+#   -z \
+#   -t 3000 \
+#   -i corpus/networking/ipv4 \
+#   -o out_ipv4 \
+#   -E 5000 \
+#   -- \
+#   ./.venv/bin/python3 python_afl_binary_baseline.py \
+#     --driver drivers/ipv4_blackbox.json
+
+# ~/software_testing/AFLplusplus/afl-fuzz -Q \
+#   -z \
+#   -t 3000 \
+#   -i corpus/networking/ipv6 \
+#   -o out_ipv6 \
+#   -E 5000 \
+#   -- \
+#   ./.venv/bin/python3 python_afl_binary_baseline.py \
+#     --driver drivers/ipv6_blackbox.json
+
+# Without QEMU for already instrumented binaries DO NOT PUT -Q
 
 # if want bug to be afl crashes as well
-# afl-fuzz -Q -i corpus/networking/cidr_mixed -o out -E 5000 -- \
-#   ./.venv/bin/python3 aflpp_binary_baseline.py \
-#   --driver drivers/cidrize.json \
 #   --report-handled-bugs-to-afl
 
 import sys
