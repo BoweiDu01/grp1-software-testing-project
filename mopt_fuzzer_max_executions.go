@@ -193,11 +193,13 @@ func (l *Logger) Log(idx int, tier int, reason string, ops []string, seedData, m
 	}
 
 	bugType, exc, line := "", "", 0
+	file := ""
 	if res.TimedOut {
 		bugType = "hang"
 		exc = "Timeout"
 	} else if tier > 0 || res.IsError {
-		bugType, exc, line = classifyBug(res.Stdout, res.Stderr)
+		bugType, exc, _ = classifyBug(res.Stdout, res.Stderr)
+		file, line = extractBugLocation(res.Stdout, res.Stderr)
 	}
 
 	msg := ""
@@ -231,7 +233,7 @@ func (l *Logger) Log(idx int, tier int, reason string, ops []string, seedData, m
 		bugType,
 		exc,
 		msg,
-		"",
+		file,
 		strconv.Itoa(line),
 		hex.EncodeToString(h[:]),
 	}
@@ -1091,6 +1093,35 @@ func (ae *ASTMutationEngine) mutateValue(v interface{}, opFunc func([]byte, [][]
 // ---------------------------------------------------------------------------
 // Evaluator & Executor
 // ---------------------------------------------------------------------------
+var tracebackFramePattern = regexp.MustCompile(`(?m)^\s*File "([^"]+)", line (\d+), in ([^\r\n]+)\s*$`)
+
+func extractTracebackFrames(stdout, stderr string) []string {
+	combined := stdout + "\n" + stderr
+	matches := tracebackFramePattern.FindAllStringSubmatch(combined, -1)
+	frames := make([]string, 0, len(matches))
+	for _, m := range matches {
+		if len(m) < 4 {
+			continue
+		}
+		file := strings.TrimSpace(m[1])
+		line := strings.TrimSpace(m[2])
+		fn := strings.TrimSpace(m[3])
+		frames = append(frames, fmt.Sprintf("%s:%s:%s", file, line, fn))
+	}
+	return frames
+}
+
+func computeBugSignature(stdout, stderr string) string {
+	cat, exc, _ := classifyBug(stdout, stderr)
+	parts := []string{cat, exc}
+	frames := extractTracebackFrames(stdout, stderr)
+	if len(frames) > 0 {
+		parts = append(parts, frames[len(frames)-1])
+	}
+	payload := strings.Join(parts, "|")
+	h := sha256.Sum256([]byte(payload))
+	return hex.EncodeToString(h[:])
+}
 
 func classifyBug(stdout, stderr string) (string, string, int) {
 	combined := stdout + "\n" + stderr
@@ -1098,7 +1129,8 @@ func classifyBug(stdout, stderr string) (string, string, int) {
 	summaryPattern := regexp.MustCompile(`\('(\w+)',\s*<class\s*'([^']+)'>,\s*.*?,.*?, (\d+)\)`)
 	match := summaryPattern.FindStringSubmatch(combined)
 	if match != nil {
-		return match[1], match[2], 0
+		lineNum, _ := strconv.Atoi(match[3])
+		return match[1], match[2], lineNum
 	}
 
 	// 2. match custom target application markers (e.g. "A performance bug has been triggered: ...")
@@ -1141,6 +1173,39 @@ func classifyBug(stdout, stderr string) (string, string, int) {
 	return "unknown", "UnknownBug", 0
 }
 
+func extractBugLocation(stdout, stderr string) (string, int) {
+	combined := stdout + "\n" + stderr
+
+	summaryPattern := regexp.MustCompile(`\('(\w+)',\s*<class\s*'([^']+)'>,\s*.*?,.*?, (\d+)\)`)
+	if match := summaryPattern.FindStringSubmatch(combined); match != nil {
+		lineNum, _ := strconv.Atoi(match[3])
+		return "", lineNum
+	}
+
+	frames := extractTracebackFrames(stdout, stderr)
+	if len(frames) > 0 {
+		parts := strings.Split(frames[len(frames)-1], ":")
+		if len(parts) >= 2 {
+			lineNum, _ := strconv.Atoi(parts[1])
+			return parts[0], lineNum
+		}
+	}
+
+	genericFileLine := regexp.MustCompile(`([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_+-]+):(\d+)`)
+	if match := genericFileLine.FindStringSubmatch(combined); match != nil {
+		lineNum, _ := strconv.Atoi(match[2])
+		return match[1], lineNum
+	}
+
+	lineOnly := regexp.MustCompile(`(?i)\bline\s+(\d+)\b`)
+	if match := lineOnly.FindStringSubmatch(combined); match != nil {
+		lineNum, _ := strconv.Atoi(match[1])
+		return "", lineNum
+	}
+
+	return "", 0
+}
+
 type Evaluator struct {
 	sync.Mutex
 	CrashHitCounts map[string]int
@@ -1158,8 +1223,7 @@ func (e *Evaluator) Evaluate(res *ExecutionResult, data []byte) (int, string, st
 
 	// 1. Check for Crashes
 	if res.IsError {
-		cat, exc, _ := classifyBug(res.Stdout, res.Stderr)
-		sig := hex.EncodeToString(sha256.New().Sum([]byte(fmt.Sprintf("%s:%s", cat, exc))))
+		sig := computeBugSignature(res.Stdout, res.Stderr)
 		
 		e.CrashHitCounts[sig]++
 		count := e.CrashHitCounts[sig]
@@ -1586,11 +1650,13 @@ func main() {
 				genStart := time.Now()
 				ops, mutated := mm.SelectAndMutate(task.Seed.Data, seedsData, task.Seed.Energy, r)
 				genTimeSec := time.Since(genStart).Seconds()
-				if atomic.LoadInt64(&totalExec) >= int64(*maxExecutions) {
+				reserved := atomic.AddInt64(&totalExec, 1)
+				if reserved > int64(*maxExecutions) {
+					atomic.AddInt64(&totalExec, -1)
 					continue
 				}
 				res := executeTarget(ctx, config, mutated, workerDir, originalDir)
-				atomic.AddInt64(&totalExec, 1)
+
 				results <- FuzzResult{Ops: ops, Mutated: mutated, ExecRes: res, Seed: task.Seed, GenerationTimeSec: genTimeSec}
 			}
 		}(w)
@@ -1628,19 +1694,19 @@ func main() {
 
 				if tier == 1 {
 					// Vulnerability Refinement Queueing: 
-					// Add hard crashes back to queue with High Energy, deduplicated by Exception Name.
+					// Add hard crashes back to queue with High Energy, deduplicated by bug signature.
 					if cat != "invalidity" && exc != "ParseException" {
 						queueMutex.Lock()
 						exists := false
 						for _, s := range seedQueue {
-							if s.Tier == 1 && s.Sig == exc {
+							if s.Tier == 1 && s.Sig == sig {
 								exists = true
 								break
 							}
 						}
 						if !exists {
 							seedQueue = append(seedQueue, &SeedEntry{
-								Data: res.Mutated, Energy: HighEnergy, Tier: 1, Sig: exc,
+								Data: res.Mutated, Energy: HighEnergy, Tier: 1, Sig: sig,
 							})
 						}
 						queueMutex.Unlock()
@@ -1657,16 +1723,19 @@ func main() {
 						exploitDir, _ := filepath.Abs(fmt.Sprintf("fuzz_env/exploit_%d", time.Now().UnixNano()))
 						r := rand.New(rand.NewSource(*seed + int64(c)*1337))
 
-						for j := 0; j < 500; j++ {
+						for j := 0; j < 250; j++ {
 							if exploCtx.Err() != nil { break }
-							if atomic.LoadInt64(&totalExec) >= int64(*maxExecutions) { break } // break if past max exec
+							reserved := atomic.AddInt64(&totalExec, 1)
+							if reserved > int64(*maxExecutions) {
+								atomic.AddInt64(&totalExec, -1)
+								break
+							} // break if past max exec
 							op := SurgicalOps[r.Intn(len(SurgicalOps))]
 							
 							genStart := time.Now()
 							mutated := op.Func(baseData, [][]byte{}, r)
 							genTimeSec := time.Since(genStart).Seconds()
 							execRes := executeTarget(exploCtx, config, mutated, exploitDir, originalDir)
-							atomic.AddInt64(&totalExec, 1)
 							lTier, _, lSig := eval.Evaluate(execRes, mutated)
 							
 							lReward := 0.0
