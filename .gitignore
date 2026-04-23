@@ -3,9 +3,21 @@
 /temp store corpus
 /venv
 venv/
+/.venv/
 __pycache__/
 *.pyc
 *.pyo
-/crashes/
-/logs/
 /IPv4-IPv6-parser/
+/.vscode/
+/crashes_old/
+bug_counts.csv
+tracebacks.log
+/logs/**
+/fuzz_env/**
+/corpus
+
+out_ipv4/
+out_ipv6
+json_baseline_out/
+logs/*
+corpus/

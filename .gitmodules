@@ -1,0 +1,3 @@
+[submodule "json-decoder"]
+	path = json-decoder
+	url = https://github.com/TrustWare-Research-Group/json-decoder.git
