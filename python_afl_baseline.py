@@ -36,9 +36,36 @@ import argparse
 import traceback
 import runpy
 import signal
+import re
+import io
+import contextlib
 
 LOG_PATH = "logs/python_afl_baseline_5000.csv"
-BUG_COUNTS_PATH = "logs/bug_counts.csv"
+
+TRACEBACK_FRAME_RE = re.compile(
+    r'^\s*File "([^"]+)", line (\d+), in ([^\r\n]+)\s*$',
+    re.MULTILINE,
+)
+
+SUMMARY_PATTERN = re.compile(
+    r"\('(\w+)',\s*<class\s*'([^']+)'>,\s*.*?,.*?, (\d+)\)"
+)
+
+CUSTOM_BUG_PATTERN = re.compile(
+    r"[Aa] (\w+) bug has been triggered: (.*)"
+)
+
+PY_EXCEPTION_LINE_RE = re.compile(
+    r'(?m)^([a-zA-Z_]\w*(?:\.[a-zA-Z_]\w*)*): (.*)$'
+)
+
+GENERIC_FILE_LINE_RE = re.compile(
+    r'([A-Za-z0-9_./\\-]+\.[A-Za-z0-9_+-]+):(\d+)'
+)
+
+LINE_ONLY_RE = re.compile(
+    r'(?i)\bline\s+(\d+)\b'
+)
 
 
 def load_driver(driver_path: str) -> dict:
@@ -55,8 +82,8 @@ def init_log() -> None:
             writer.writerow([
                 "timestamp",
                 "input_hash",
-                "status",            # success / handled_bug / native_crash
-                "afl_reportable",    # true / false
+                "status",
+                "afl_reportable",
                 "exit_code",
                 "timed_out",
                 "elapsed_sec",
@@ -72,14 +99,6 @@ def init_log() -> None:
             ])
 
 
-def ensure_bug_counts_exists() -> None:
-    os.makedirs("logs", exist_ok=True)
-    if not os.path.exists(BUG_COUNTS_PATH):
-        with open(BUG_COUNTS_PATH, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["bug_type", "exc_type", "exc_message", "filename", "lineno", "count"])
-
-
 def log_row(row: list) -> None:
     with open(LOG_PATH, "a", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow(row)
@@ -90,21 +109,10 @@ def decode_for_log(data: bytes) -> str:
     return text.replace("\r", "\\r").replace("\n", "\\n")
 
 
-def classify_bug_type(exc_name: str, message: str) -> str:
-    e = (exc_name or "").lower()
-    m = (message or "").lower()
-
-    if "timeout" in e or "timeout" in m:
-        return "performance"
-    if "memory" in e or "memory" in m:
-        return "memory"
-    if "parse" in e or "syntax" in e:
-        return "invalidity"
-    if "valueerror" in e or "invalid" in m:
-        return "invalidity"
-    if "assert" in e:
-        return "functional"
-    return "exception"
+def normalize_exception_name(exc_name: str) -> str:
+    if not exc_name:
+        return "UnknownBug"
+    return exc_name.split(".")[-1]
 
 
 def build_target_argv(driver: dict, fuzz_text: str) -> list[str]:
@@ -118,60 +126,118 @@ def build_target_argv(driver: dict, fuzz_text: str) -> list[str]:
 
 
 def build_command_display(driver: dict, argv: list[str]) -> str:
-    interpreter = driver.get("interpreter", "python3")
-    return " ".join([interpreter] + argv)
+    interpreter = driver.get("interpreter", "")
+    if interpreter:
+        return " ".join([interpreter] + argv)
+    return " ".join(argv)
 
 
-def get_file_state(path: str):
-    try:
-        st = os.stat(path)
-        return (st.st_mtime_ns, st.st_size)
-    except FileNotFoundError:
-        return None
+def extract_traceback_frames(tb_text: str) -> list[tuple[str, str, str]]:
+    matches = TRACEBACK_FRAME_RE.findall(tb_text or "")
+    return [(file.strip(), line.strip(), func.strip()) for file, line, func in matches]
 
 
-def read_last_bug_count_row():
-    if not os.path.exists(BUG_COUNTS_PATH):
-        return None
+def extract_bug_location(tb_text: str) -> tuple[str, str]:
+    combined = tb_text or ""
 
-    try:
-        with open(BUG_COUNTS_PATH, "r", newline="", encoding="utf-8") as f:
-            rows = list(csv.DictReader(f))
-        if not rows:
-            return None
-        row = rows[-1]
-        return {
-            "bug_type": str(row.get("bug_type", "")).strip(),
-            "exc_type": str(row.get("exc_type", "")).strip(),
-            "exc_message": str(row.get("exc_message", "")).strip(),
-            "filename": str(row.get("filename", "")).strip(),
-            "lineno": str(row.get("lineno", "")).strip(),
-            "count": str(row.get("count", "")).strip(),
-        }
-    except Exception:
-        return None
+    m = SUMMARY_PATTERN.search(combined)
+    if m:
+        return "", m.group(3).strip()
+
+    frames = extract_traceback_frames(combined)
+    if frames:
+        file_name, line_no, _ = frames[-1]
+        return file_name, line_no
+
+    m = GENERIC_FILE_LINE_RE.search(combined)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+
+    m = LINE_ONLY_RE.search(combined)
+    if m:
+        return "", m.group(1).strip()
+
+    return "", ""
 
 
-def bug_fingerprint_from_row(row: dict) -> str:
-    if not row:
-        return ""
+def classify_bug(stdout_text: str, stderr_text: str) -> tuple[str, str]:
+    combined = (stdout_text or "") + "\n" + (stderr_text or "")
+
+    # 1. internal tuple format
+    m = SUMMARY_PATTERN.search(combined)
+    if m:
+        bug_type = m.group(1).strip()
+        exc_name = normalize_exception_name(m.group(2).strip())
+        return bug_type, exc_name
+
+    # 2. custom marker format
+    m = CUSTOM_BUG_PATTERN.search(combined)
+    if m:
+        bug_type = m.group(1).strip().lower()
+        exc_name = m.group(2).strip()
+        if len(exc_name) > 50:
+            exc_name = exc_name[:50]
+        return bug_type, exc_name
+
+    # 3. standard Python exception line
+    m = PY_EXCEPTION_LINE_RE.search(combined)
+    if m:
+        full_exc = m.group(1).strip()
+        exc_name = normalize_exception_name(full_exc)
+        return "python_exception", exc_name
+
+    # 4. ParseException special case
+    if "ParseException" in combined:
+        return "invalidity", "ParseException"
+
+    # 5. raw fallback
+    fallback = (stderr_text or "").strip()
+    if not fallback:
+        fallback = (stdout_text or "").strip()
+    if fallback:
+        fallback = fallback.replace("\n", " ")
+        if len(fallback) > 40:
+            fallback = fallback[:40]
+        return "raw_crash", fallback
+
+    return "unknown", "UnknownBug"
+
+
+def extract_message(stdout_text: str, stderr_text: str) -> str:
+    clean = (stderr_text or "").strip()
+    if not clean:
+        clean = (stdout_text or "").strip()
+
+    if clean:
+        return clean.splitlines()[0][:200]
+
+    return ""
+
+
+def build_bug_fingerprint(
+    bug_type: str,
+    exc_name: str,
+    file_name: str,
+    line_no: str,
+) -> str:
     raw = "||".join([
-        row.get("bug_type", ""),
-        row.get("exc_type", ""),
-        row.get("exc_message", ""),
-        row.get("filename", ""),
-        row.get("lineno", ""),
+        bug_type or "",
+        normalize_exception_name(exc_name),
+        file_name or "",
+        line_no or "",
     ])
     return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
 
 
-def run_target_in_process(driver: dict, data: bytes) -> list[str]:
+def run_target_in_process(driver: dict, data: bytes) -> tuple[list[str], str, str]:
     """
     Run the Python target in-process so python-afl can instrument it.
 
+    Returns:
+        (argv, captured_stdout, captured_stderr)
+
     IMPORTANT:
-    - Keep cwd at repo root/current working dir so target writes to ./logs
-      like your custom fuzzer.
+    - Keep cwd at repo root/current working dir.
     - Only add target_dir to sys.path for imports.
     """
     target_path = os.path.abspath(driver["target"])
@@ -184,6 +250,9 @@ def run_target_in_process(driver: dict, data: bytes) -> list[str]:
     old_sys_path = sys.path[:]
     old_cwd = os.getcwd()
 
+    stdout_buf = io.StringIO()
+    stderr_buf = io.StringIO()
+
     try:
         sys.argv = argv
 
@@ -193,9 +262,10 @@ def run_target_in_process(driver: dict, data: bytes) -> list[str]:
         if target_dir not in sys.path:
             sys.path.insert(0, target_dir)
 
-        # DO NOT chdir(target_dir)
-        runpy.run_path(target_path, run_name="__main__")
-        return argv
+        with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(stderr_buf):
+            runpy.run_path(target_path, run_name="__main__")
+
+        return argv, stdout_buf.getvalue(), stderr_buf.getvalue()
 
     finally:
         sys.argv = old_argv
@@ -228,11 +298,11 @@ def write_log(
     mutated_text: str,
     mutated_b64: str,
     bug_type: str,
-    exc_name: str,
+    exception: str,
     message: str,
     file_name: str,
     line_no: str,
-    bug_fp: str,
+    bug_fingerprint: str,
 ) -> None:
     elapsed = time.time() - start_time
     log_row([
@@ -247,36 +317,15 @@ def write_log(
         mutated_text,
         mutated_b64,
         bug_type,
-        exc_name,
+        exception,
         message,
         file_name,
         line_no,
-        bug_fp,
+        bug_fingerprint,
     ])
 
 
-def detect_handled_bug_from_bug_counts(before_state):
-    after_state = get_file_state(BUG_COUNTS_PATH)
-    if before_state == after_state:
-        return None
-
-    row = read_last_bug_count_row()
-    if row is None:
-        return None
-
-    return {
-        "bug_type": row["bug_type"],
-        "exc_name": row["exc_type"],
-        "message": row["exc_message"],
-        "file_name": row["filename"],
-        "line_no": row["lineno"],
-        "bug_fingerprint": bug_fingerprint_from_row(row),
-    }
-
-
 def fuzz_one(driver: dict, report_handled_bugs_to_afl: bool) -> None:
-    ensure_bug_counts_exists()
-
     start = time.time()
     data = sys.stdin.buffer.read()
 
@@ -288,31 +337,35 @@ def fuzz_one(driver: dict, report_handled_bugs_to_afl: bool) -> None:
     exit_code = 0
     timed_out = "false"
     bug_type = ""
-    exc_name = ""
+    exception = ""
     message = ""
     file_name = ""
     line_no = ""
     command_display = ""
-    bug_fp = ""
+    bug_fingerprint = ""
     afl_reportable = False
 
-    bug_counts_before = get_file_state(BUG_COUNTS_PATH)
-
     try:
-        argv = run_target_in_process(driver, data)
+        argv, captured_stdout, captured_stderr = run_target_in_process(driver, data)
         command_display = build_command_display(driver, argv)
 
-        handled = detect_handled_bug_from_bug_counts(bug_counts_before)
-        if handled is not None:
+        combined = (captured_stdout or "") + "\n" + (captured_stderr or "")
+        has_bug_markers = (
+            "Bug Type" in combined or
+            "Exception:" in combined or
+            "Traceback" in combined or
+            "bug has been triggered" in combined.lower()
+        )
+
+        if has_bug_markers:
             status = "handled_bug"
             exit_code = 0
-            bug_type = handled["bug_type"]
-            exc_name = handled["exc_name"]
-            message = handled["message"]
-            file_name = handled["file_name"]
-            line_no = handled["line_no"]
-            bug_fp = handled["bug_fingerprint"]
             afl_reportable = report_handled_bugs_to_afl
+
+            bug_type, exception = classify_bug(captured_stdout, captured_stderr)
+            message = extract_message(captured_stdout, captured_stderr)
+            file_name, line_no = extract_bug_location(combined)
+            bug_fingerprint = build_bug_fingerprint(bug_type, exception, file_name, line_no)
 
             write_log(
                 start_time=start,
@@ -325,11 +378,11 @@ def fuzz_one(driver: dict, report_handled_bugs_to_afl: bool) -> None:
                 mutated_text=mutated_text,
                 mutated_b64=mutated_b64,
                 bug_type=bug_type,
-                exc_name=exc_name,
+                exception=exception,
                 message=message,
                 file_name=file_name,
                 line_no=line_no,
-                bug_fp=bug_fp,
+                bug_fingerprint=bug_fingerprint,
             )
 
             if report_handled_bugs_to_afl:
@@ -348,19 +401,12 @@ def fuzz_one(driver: dict, report_handled_bugs_to_afl: bool) -> None:
         else:
             status = "native_crash"
             afl_reportable = True
-            bug_type = "exception"
-            exc_name = "SystemExit"
-            message = str(e)
 
-            tb = traceback.extract_tb(e.__traceback__)
-            if tb:
-                last = tb[-1]
-                file_name = last.filename
-                line_no = str(last.lineno)
-
-            bug_fp = hashlib.sha256(
-                f"{bug_type}||{exc_name}||{message}||{file_name}||{line_no}".encode("utf-8", errors="ignore")
-            ).hexdigest()
+            tb_text = traceback.format_exc()
+            bug_type, exception = classify_bug("", tb_text)
+            message = str(e)[:200]
+            file_name, line_no = extract_bug_location(tb_text)
+            bug_fingerprint = build_bug_fingerprint(bug_type, exception, file_name, line_no)
 
         write_log(
             start_time=start,
@@ -373,37 +419,30 @@ def fuzz_one(driver: dict, report_handled_bugs_to_afl: bool) -> None:
             mutated_text=mutated_text,
             mutated_b64=mutated_b64,
             bug_type=bug_type,
-            exc_name=exc_name,
+            exception=exception,
             message=message,
             file_name=file_name,
             line_no=line_no,
-            bug_fp=bug_fp,
+            bug_fingerprint=bug_fingerprint,
         )
 
         if code != 0:
             _force_afl_crash()
         return
 
-    except Exception as e:
+    except Exception:
         argv = build_target_argv(driver, data.decode("utf-8", errors="ignore"))
         command_display = build_command_display(driver, argv)
 
-        status = "native_crash"
-        afl_reportable = True
-        exit_code = 1
-        bug_type = classify_bug_type(type(e).__name__, str(e))
-        exc_name = type(e).__name__
-        message = str(e)
+        status = "handled_bug"
+        exit_code = 0
+        afl_reportable = report_handled_bugs_to_afl
 
-        tb = traceback.extract_tb(e.__traceback__)
-        if tb:
-            last = tb[-1]
-            file_name = last.filename
-            line_no = str(last.lineno)
-
-        bug_fp = hashlib.sha256(
-            f"{bug_type}||{exc_name}||{message}||{file_name}||{line_no}".encode("utf-8", errors="ignore")
-        ).hexdigest()
+        tb_text = traceback.format_exc()
+        bug_type, exception = classify_bug("", tb_text)
+        message = extract_message("", tb_text)
+        file_name, line_no = extract_bug_location(tb_text)
+        bug_fingerprint = build_bug_fingerprint(bug_type, exception, file_name, line_no)
 
         write_log(
             start_time=start,
@@ -416,14 +455,16 @@ def fuzz_one(driver: dict, report_handled_bugs_to_afl: bool) -> None:
             mutated_text=mutated_text,
             mutated_b64=mutated_b64,
             bug_type=bug_type,
-            exc_name=exc_name,
+            exception=exception,
             message=message,
             file_name=file_name,
             line_no=line_no,
-            bug_fp=bug_fp,
+            bug_fingerprint=bug_fingerprint,
         )
 
-        _force_afl_crash()
+        if report_handled_bugs_to_afl:
+            _force_afl_crash()
+        return
 
     else:
         write_log(
@@ -437,11 +478,11 @@ def fuzz_one(driver: dict, report_handled_bugs_to_afl: bool) -> None:
             mutated_text=mutated_text,
             mutated_b64=mutated_b64,
             bug_type=bug_type,
-            exc_name=exc_name,
+            exception=exception,
             message=message,
             file_name=file_name,
             line_no=line_no,
-            bug_fp=bug_fp,
+            bug_fingerprint=bug_fingerprint,
         )
 
 
@@ -451,7 +492,7 @@ def main() -> None:
     parser.add_argument(
         "--report-handled-bugs-to-afl",
         action="store_true",
-        help="Treat handled bugs from bug_counts.csv as AFL crashes too",
+        help="Treat handled bugs from the current run's traceback as AFL crashes too",
     )
     args = parser.parse_args()
 
